@@ -1,0 +1,193 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    font-family: 'Inter', sans-serif;
+    background: #E5E5E5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  button, input, textarea {
+    font-family: 'Inter', sans-serif;
+  }
+
+  /* ---------- Phone frame ---------- */
+  #phone-frame {
+    width: 390px;
+    height: 844px;
+    border-radius: 50px;
+    overflow: hidden;
+    background: #FAFAFA;
+    box-shadow: 0 0 0 10px #2A2A2A, 0 0 0 12px #3A3A3A, 0 40px 80px rgba(0,0,0,0.6);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---------- Status bar ---------- */
+  #status-bar {
+    height: 50px;
+    background: #FAFAFA;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 28px 0;
+    flex-shrink: 0;
+    position: relative;
+  }
+  #status-bar .clock {
+    font-size: 15px;
+    font-weight: 600;
+    color: #1B1B1B;
+    letter-spacing: -0.2px;
+  }
+  #status-bar .notch {
+    width: 120px;
+    height: 32px;
+    background: #1B1B1B;
+    border-radius: 20px;
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 0;
+  }
+  #status-bar .icons {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  #status-bar .battery-outer {
+    width: 22px;
+    height: 11px;
+    border: 1.5px solid #1B1B1B;
+    border-radius: 3px;
+    padding: 1.5px;
+    display: flex;
+    align-items: center;
+  }
+  #status-bar .battery-inner {
+    width: 80%;
+    height: 100%;
+    background: #1B1B1B;
+    border-radius: 1.5px;
+  }
+  #status-bar .battery-tip {
+    width: 2px;
+    height: 5px;
+    background: #1B1B1B;
+    border-radius: 1px;
+    margin-left: 1px;
+  }
+
+  /* ---------- App content area ---------- */
+  #app-content {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .screen {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #FAFAFA;
+  }
+
+  .scroll-area {
+    flex: 1;
+    overflow-y: auto;
+  }
+
+  /* ---------- Bottom nav ---------- */
+  #bottom-nav {
+    height: 82px;
+    background: #FFFFFF;
+    border-top: 1px solid #EFEFEF;
+    display: flex;
+    align-items: center;
+    justify-content: space-around;
+    padding-bottom: 20px;
+    flex-shrink: 0;
+  }
+  #bottom-nav button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 6px 16px;
+    color: #ABABAB;
+    transition: color 0.15s ease;
+  }
+  #bottom-nav button.active {
+    color: #1D9E75;
+  }
+  #bottom-nav button span {
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.2px;
+  }
+  #bottom-nav button.active span {
+    font-weight: 600;
+  }
+
+  /* ---------- Generic helpers ---------- */
+  .fade-scroll::-webkit-scrollbar { width: 0; height: 0; }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #E8F7F2;
+    color: #1D9E75;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 20px;
+  }
+  .chip button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #1D9E75;
+    padding: 0;
+    line-height: 1;
+    font-size: 14px;
+  }
+
+  .primary-btn {
+    width: 100%;
+    padding: 15px;
+    background: #1D9E75;
+    border: none;
+    border-radius: 14px;
+    color: #FFFFFF;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    letter-spacing: -0.2px;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+  .primary-btn:disabled {
+    cursor: default;
+  }
+  .primary-btn.done {
+    background: #E8F7F2;
+    color: #1D9E75;
+  }
+
+  /* scrollbar hide for suggestion lists etc. handled generically */
