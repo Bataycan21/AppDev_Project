@@ -310,7 +310,7 @@ function renderOnboardingScreen() {
   saveBtn.textContent = "Save Profile";
   saveBtn.addEventListener("click", () => {
     state.hasProfile = true;
-    render();
+    startQuiz();
   });
   form.appendChild(saveBtn);
 
@@ -1037,12 +1037,14 @@ function renderQuizScreen() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
 
   const header = el("div", "display:flex;align-items:center;gap:10px;padding:16px 24px 12px;flex-shrink:0;");
-  const backBtn = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#1B1B1B;");
-  backBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
-  backBtn.addEventListener("click", () => { state.showQuiz = false; render(); });
+  if (state.activeTab === "profile" || quizState.done) {
+    const backBtn = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#1B1B1B;");
+    backBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
+    backBtn.addEventListener("click", () => { state.showQuiz = false; render(); });
+    header.appendChild(backBtn);
+  }
   const titleSpan = el("span", "font-size:15px;font-weight:600;color:#1B1B1B;");
   titleSpan.textContent = "Career Quiz";
-  header.appendChild(backBtn);
   header.appendChild(titleSpan);
   root.appendChild(header);
 
@@ -1108,7 +1110,7 @@ function renderQuizScreen() {
     retakeBtn.addEventListener("click", startQuiz);
 
     const doneBtn = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;");
-    doneBtn.textContent = "Back to Profile";
+    doneBtn.textContent = state.activeTab === "profile" ? "Back to Profile" : "Continue to Home";
     doneBtn.addEventListener("click", () => { state.showQuiz = false; render(); });
 
     content.appendChild(retakeBtn);
