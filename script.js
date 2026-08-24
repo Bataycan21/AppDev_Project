@@ -76,6 +76,7 @@ const state = {
   savedIds: new Set(["2", "3"]),
   homeFilter: "All",
   showHomeFilter: false,
+  showQuiz: false,
 };
 
 const contentEl = document.getElementById("app-content");
@@ -91,6 +92,11 @@ function render() {
   if (state.selectedPostingId) {
     const posting = POSTINGS.find((p) => p.id === state.selectedPostingId);
     contentEl.appendChild(renderPostingDetailScreen(posting));
+    return;
+  }
+
+  if (state.showQuiz) {
+    contentEl.appendChild(renderQuizScreen());
     return;
   }
 
@@ -825,6 +831,11 @@ function renderProfileScreen() {
   });
   content.appendChild(saveBtn);
 
+  const quizBtn = el("button", "width:100%;padding:14px;background:#FFFFFF;border:1.5px solid #1D9E75;border-radius:14px;color:#1D9E75;font-size:14px;font-weight:600;cursor:pointer;");
+  quizBtn.textContent = "Take Career Quiz →";
+  quizBtn.addEventListener("click", startQuiz);
+  content.appendChild(quizBtn);
+
   root.appendChild(content);
   return root;
 }
@@ -938,6 +949,173 @@ function renderNotificationsScreen() {
   });
   root.appendChild(list);
 
+  return root;
+}
+
+// ===========================================================
+// Career Quiz
+// ===========================================================
+const QUIZ_QUESTIONS = [
+  {
+    q: "Which task sounds most fun?",
+    options: [
+      { t: "Building an app feature", tag: "Engineering" },
+      { t: "Finding patterns in a spreadsheet", tag: "Data" },
+      { t: "Designing a clean UI screen", tag: "Design" },
+      { t: "Planning a team's workflow", tag: "Business" },
+    ],
+  },
+  {
+    q: "Pick a tool you'd rather master:",
+    options: [
+      { t: "React / Flutter", tag: "Engineering" },
+      { t: "SQL / Tableau", tag: "Data" },
+      { t: "Figma", tag: "Design" },
+      { t: "Excel / Notion", tag: "Business" },
+    ],
+  },
+  {
+    q: "In a group project, you're usually the one who:",
+    options: [
+      { t: "Writes the code", tag: "Engineering" },
+      { t: "Crunches the numbers", tag: "Data" },
+      { t: "Makes it look good", tag: "Design" },
+      { t: "Keeps everyone organized", tag: "Business" },
+    ],
+  },
+  {
+    q: "Which problem interests you more?",
+    options: [
+      { t: "Why is this app slow?", tag: "Engineering" },
+      { t: "Why did sales drop last month?", tag: "Data" },
+      { t: "Why is this screen confusing?", tag: "Design" },
+      { t: "Why is this process inefficient?", tag: "Business" },
+    ],
+  },
+  {
+    q: "Pick a dream first job:",
+    options: [
+      { t: "Software Engineer", tag: "Engineering" },
+      { t: "Data Analyst", tag: "Data" },
+      { t: "UI/UX Designer", tag: "Design" },
+      { t: "Business/Ops Associate", tag: "Business" },
+    ],
+  },
+];
+
+const FIELD_INFO = {
+  Engineering: { label: "Software Engineering", office: "Engineering / Product teams", desc: "You like building things that work. Look at software, mobile, or web dev roles." },
+  Data: { label: "Data & Analytics", office: "Data / Analytics office", desc: "You like finding signal in numbers. Look at data analyst or BI roles." },
+  Design: { label: "UI/UX Design", office: "Design / Product team", desc: "You care about how things look and feel. Look at product design roles." },
+  Business: { label: "Business Operations", office: "Business/Ops or PM office", desc: "You like organizing people and process. Look at ops, PM, or coordinator roles." },
+};
+
+// Map each posting to the quiz field it best fits (by id)
+const POSTING_FIELD = { "1": "Engineering", "2": "Data", "3": "Engineering", "4": "Data", "5": "Design" };
+
+const quizState = { index: 0, tallies: {}, done: false };
+
+function startQuiz() {
+  quizState.index = 0;
+  quizState.tallies = {};
+  quizState.done = false;
+  state.showQuiz = true;
+  render();
+}
+
+function answerQuiz(tag) {
+  quizState.tallies[tag] = (quizState.tallies[tag] || 0) + 1;
+  if (quizState.index < QUIZ_QUESTIONS.length - 1) {
+    quizState.index += 1;
+  } else {
+    quizState.done = true;
+  }
+  render();
+}
+
+function renderQuizScreen() {
+  const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
+
+  const header = el("div", "display:flex;align-items:center;gap:10px;padding:16px 24px 12px;flex-shrink:0;");
+  const backBtn = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#1B1B1B;");
+  backBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
+  backBtn.addEventListener("click", () => { state.showQuiz = false; render(); });
+  const titleSpan = el("span", "font-size:15px;font-weight:600;color:#1B1B1B;");
+  titleSpan.textContent = "Career Quiz";
+  header.appendChild(backBtn);
+  header.appendChild(titleSpan);
+  root.appendChild(header);
+
+  const content = el("div", "flex:1;overflow-y:auto;padding:0 24px 24px;");
+
+  if (!quizState.done) {
+    const q = QUIZ_QUESTIONS[quizState.index];
+
+    const barTrack = el("div", "width:100%;height:6px;background:#EFEFEF;border-radius:3px;margin-bottom:10px;overflow:hidden;");
+    const barFill = el("div", `height:100%;background:#1D9E75;border-radius:3px;width:${((quizState.index) / QUIZ_QUESTIONS.length) * 100}%;transition:width 0.2s ease;`);
+    barTrack.appendChild(barFill);
+    content.appendChild(barTrack);
+
+    const progress = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 8px;");
+    progress.textContent = `Question ${quizState.index + 1} of ${QUIZ_QUESTIONS.length}`;
+    const qTitle = el("h2", "font-size:19px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;margin:0 0 20px;");
+    qTitle.textContent = q.q;
+    content.appendChild(progress);
+    content.appendChild(qTitle);
+
+    const optWrap = el("div", "display:flex;flex-direction:column;gap:10px;");
+    q.options.forEach((opt) => {
+      const btn = el("button", "text-align:left;padding:14px 16px;background:#FFFFFF;border:1.5px solid #E8E8E8;border-radius:12px;font-size:14px;color:#1B1B1B;cursor:pointer;");
+      btn.textContent = opt.t;
+      btn.addEventListener("click", () => answerQuiz(opt.tag));
+      optWrap.appendChild(btn);
+    });
+    content.appendChild(optWrap);
+  } else {
+    const top = Object.entries(quizState.tallies).sort((a, b) => b[1] - a[1])[0][0];
+    const info = FIELD_INFO[top];
+
+    const badge = el("div", "width:56px;height:56px;border-radius:16px;background:#E8F7F2;display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:16px;");
+    badge.textContent = "✦";
+    const resultLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 6px;");
+    resultLabel.textContent = "Your best fit";
+    const resultTitle = el("h2", "font-size:22px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 10px;");
+    resultTitle.textContent = info.label;
+    const officeP = el("p", "font-size:13px;color:#1D9E75;font-weight:600;margin:0 0 12px;");
+    officeP.textContent = `Go to: ${info.office}`;
+    const descP = el("p", "font-size:14px;color:#3A3A3A;line-height:1.6;margin:0 0 24px;");
+    descP.textContent = info.desc;
+
+    content.appendChild(badge);
+    content.appendChild(resultLabel);
+    content.appendChild(resultTitle);
+    content.appendChild(officeP);
+    content.appendChild(descP);
+
+    // Matching postings for this field
+    const matches = POSTINGS.filter((p) => POSTING_FIELD[p.id] === top);
+    if (matches.length > 0) {
+      const matchLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 10px;");
+      matchLabel.textContent = "Postings for you";
+      content.appendChild(matchLabel);
+      const matchList = el("div", "display:flex;flex-direction:column;gap:10px;margin-bottom:20px;");
+      matches.forEach((p) => matchList.appendChild(renderPostingCard(p)));
+      content.appendChild(matchList);
+    }
+
+    const retakeBtn = el("button", "width:100%;padding:14px;background:#F0F0F0;border:none;border-radius:14px;color:#1B1B1B;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:10px;");
+    retakeBtn.textContent = "Retake Quiz";
+    retakeBtn.addEventListener("click", startQuiz);
+
+    const doneBtn = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;");
+    doneBtn.textContent = "Back to Profile";
+    doneBtn.addEventListener("click", () => { state.showQuiz = false; render(); });
+
+    content.appendChild(retakeBtn);
+    content.appendChild(doneBtn);
+  }
+
+  root.appendChild(content);
   return root;
 }
 
