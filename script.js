@@ -1,88 +1,298 @@
 /* =========================================================
    SkillMatch — vanilla JS port of the React/TSX prototype
+   Backed by Supabase Auth + DB: student & company accounts
    ========================================================= */
 
-const POSTINGS = [
-  {
-    id: "1",
-    company: "Accenture Philippines",
-    role: "Software Engineering Intern",
-    fitScore: 94,
-    location: "BGC, Taguig · On-site",
-    summary: "React, TypeScript, and REST APIs required. Agile team of 8.",
-    description:
-      "Join our delivery team building enterprise web applications for financial clients. You'll work alongside senior engineers on real production features, participate in daily standups, and contribute to code reviews. The role requires strong fundamentals in component-based UI development and familiarity with RESTful API integration.",
-    tags: ["React", "TypeScript", "REST APIs", "Agile", "Git"],
-    logo: "A",
-  },
-  {
-    id: "2",
-    company: "Globe Telecom",
-    role: "Data Analytics OJT",
-    fitScore: 87,
-    location: "Mandaluyong · Hybrid",
-    summary: "Python and SQL for telco data pipelines. Tableau reporting.",
-    description:
-      "Work with Globe's data engineering team to build and maintain ETL pipelines processing millions of subscriber records daily. You'll write SQL queries, build Python scripts for data transformation, and create dashboards in Tableau for business stakeholders.",
-    tags: ["Python", "SQL", "Tableau", "ETL", "Pandas"],
-    logo: "G",
-  },
-  {
-    id: "3",
-    company: "PayMaya",
-    role: "Mobile Dev Intern (Flutter)",
-    fitScore: 81,
-    location: "Makati · On-site",
-    summary: "Flutter/Dart for fintech mobile features. Strong Dart skills.",
-    description:
-      "Help build new features on PayMaya's consumer app used by 5M+ Filipinos. You'll work on UI components, integrate payment APIs, and write unit tests. Good understanding of state management patterns is expected.",
-    tags: ["Flutter", "Dart", "Firebase", "UI/UX", "Testing"],
-    logo: "P",
-  },
-  {
-    id: "4",
-    company: "Thinking Machines",
-    role: "ML Engineering Intern",
-    fitScore: 76,
-    location: "BGC, Taguig · Remote",
-    summary: "Python ML pipelines, scikit-learn, model deployment basics.",
-    description:
-      "Contribute to client-facing machine learning projects across agriculture, finance, and logistics. You'll help train models, evaluate performance metrics, and assist in deploying models to staging environments.",
-    tags: ["Python", "scikit-learn", "ML", "Jupyter", "Docker"],
-    logo: "T",
-  },
-  {
-    id: "5",
-    company: "Canva Philippines",
-    role: "Frontend Engineering Intern",
-    fitScore: 72,
-    location: "Manila · Hybrid",
-    summary: "Web performance, React, canvas rendering APIs, TypeScript.",
-    description:
-      "Work on Canva's web editor team to improve rendering performance and build new canvas interactions. Requires solid JavaScript fundamentals and enthusiasm for visual tooling.",
-    tags: ["React", "TypeScript", "Canvas API", "Performance", "CSS"],
-    logo: "C",
-  },
-];
+const SUPABASE_URL = "https://noluueokvovoxtkvpusm.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5vbHV1ZW9rdm92b3h0a3ZwdXNtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NDkyNzgsImV4cCI6MjEwMzIyNTI3OH0.ydJfA5ZajXJv9E-3FDMl5EP9KHVIenubImfKE5i4eV4";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+let POSTINGS = [];
+let studentId = null;   // == auth user id, when logged in as a student
+let companyId = null;   // == auth user id, when logged in as a company
+
+function mapPostingRow(row) {
+  const c = row.companies || {};
+  return {
+    id: row.id,
+    company: row.company,
+    role: row.role,
+    location: row.location,
+    summary: row.summary,
+    description: row.description,
+    tags: row.tags || [],
+    logo: row.logo,
+    companyId: row.company_id,
+    companyIndustry: c.industry || "",
+    companySpecialization: c.specialization || "",
+    companyAbout: c.about || "",
+  };
+}
+
+// ---------------------------------------------------------
+// Auth state & helpers
+// ---------------------------------------------------------
+const authState = { mode: "login", role: "student", email: "", password: "", companyName: "", error: "", info: "" };
+
+async function signUp() {
+  authState.error = "";
+  authState.info = "";
+  const { email, password, role, companyName } = authState;
+  if (!email || !password) { authState.error = "Enter an email and password."; render(); return; }
+  if (role === "company" && !companyName.trim()) { authState.error = "Enter a company name."; render(); return; }
+
+  // Stash the chosen role/company name in the auth user's own metadata.
+  // This survives the "check your email to confirm" gap, since no
+  // session exists yet to write to our own tables until they confirm
+  // and log in for the first time (see routeAfterAuth below).
+  const { data, error } = await sb.auth.signUp({
+    email,
+    password,
+    options: { data: { pending_role: role, pending_company_name: companyName } },
+  });
+  if (error) { authState.error = error.message; render(); return; }
+
+  // Supabase returns a user with an empty identities array (no error!)
+  // when the email is already registered, to avoid leaking which
+  // emails exist. Treat that as "please log in instead."
+  if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+    authState.error = "This email is already registered. Please log in instead.";
+    authState.mode = "login";
+    render();
+    return;
+  }
+
+  if (!data.session) {
+    authState.info = "Check your email to confirm your account, then log in.";
+    authState.mode = "login";
+    render();
+    return;
+  }
+  await routeAfterAuth();
+}
+
+async function createProfileAfterSignup(userId, role, companyName) {
+  await sb.from("profiles").insert({ id: userId, role });
+  if (role === "student") {
+    await sb.from("students").insert({ id: userId, name: "" });
+  } else {
+    await sb.from("companies").insert({ id: userId, name: companyName, logo: (companyName || "?").trim().charAt(0).toUpperCase() });
+  }
+}
+
+async function signIn() {
+  authState.error = "";
+  authState.info = "";
+  const { email, password } = authState;
+  if (!email || !password) { authState.error = "Enter an email and password."; render(); return; }
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { authState.error = error.message; render(); return; }
+  await routeAfterAuth();
+}
+
+async function signOut() {
+  await sb.auth.signOut();
+  studentId = null;
+  companyId = null;
+  state.session = null;
+  state.hasProfile = false;
+  state.activeTab = "home";
+  state.selectedPostingId = null;
+  render();
+}
+
+// After a successful login/signup, look up the user's role and load
+// the right dataset (student browsing data vs company's own listings).
+// If this is their first-ever authenticated login (no profiles row
+// yet), create the profile + student/company row now, using the role
+// they picked at signup (stashed in user_metadata).
+async function routeAfterAuth() {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return;
+
+  contentEl.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ABABAB;font-size:13px;">Loading…</div>`;
+
+  let { data: profileRows } = await sb.from("profiles").select("role").eq("id", user.id).limit(1);
+  let role = profileRows && profileRows[0] ? profileRows[0].role : null;
+
+  if (!role) {
+    const meta = user.user_metadata || {};
+    role = meta.pending_role || "student";
+    await createProfileAfterSignup(user.id, role, meta.pending_company_name || "");
+  }
+
+  if (role === "company") {
+    companyId = user.id;
+    state.session = { userId: user.id, role: "company", email: user.email };
+    await loadCompanyListings();
+  } else {
+    studentId = user.id;
+    state.session = { userId: user.id, role: "student", email: user.email };
+    await loadStudentData();
+  }
+  render();
+}
+
+// Loads public postings + this student's profile/applications/saves.
+async function loadStudentData() {
+  const { data: postingRows } = await sb
+    .from("postings")
+    .select("*, companies(industry,specialization,about,name)")
+    .order("created_at");
+  POSTINGS = (postingRows || []).map(mapPostingRow);
+
+  const { data: studentRows } = await sb.from("students").select("*").eq("id", studentId).limit(1);
+  const s = studentRows && studentRows[0];
+  if (s) {
+    profileState.skills = s.skills || [];
+    profileState.interests = s.interests || "";
+    profileState.program = s.program || "";
+    profileState.yearLevel = s.year_level || "";
+    state.hasProfile = !!(s.program); // onboarding sets program, so its presence = profile completed
+  }
+
+  const { data: apps } = await sb.from("applications").select("posting_id").eq("student_id", studentId);
+  state.appliedIds = new Set((apps || []).map((a) => a.posting_id));
+
+  const { data: saves } = await sb.from("saved_postings").select("posting_id").eq("student_id", studentId);
+  state.savedIds = new Set((saves || []).map((sv) => sv.posting_id));
+
+  recomputeMatches();
+}
+
+// Persists the current profileState to Supabase for the logged-in student.
+async function persistProfile() {
+  if (!studentId) return;
+  await sb.from("students").update({
+    program: profileState.program,
+    year_level: profileState.yearLevel,
+    skills: profileState.skills,
+    interests: profileState.interests,
+  }).eq("id", studentId);
+}
+
+// ---------------------------------------------------------
+// Company: own listings (post / edit / delete)
+// ---------------------------------------------------------
+let companyName = "";
+let companyListings = [];
+const companyProfileState = { name: "", industry: "", specialization: "", workType: "", about: "" };
+
+async function loadCompanyListings() {
+  const { data: companyRows } = await sb.from("companies").select("*").eq("id", companyId).limit(1);
+  const c = companyRows && companyRows[0];
+  companyName = c ? c.name : "";
+  if (c) {
+    companyProfileState.name = c.name || "";
+    companyProfileState.industry = c.industry || "";
+    companyProfileState.specialization = c.specialization || "";
+    companyProfileState.workType = c.work_type || "";
+    companyProfileState.about = c.about || "";
+  }
+  state.hasCompanyProfile = !!(c && c.industry);
+
+  const { data: rows } = await sb.from("postings").select("*").eq("company_id", companyId).order("created_at");
+  companyListings = (rows || []).map(mapPostingRow);
+}
+
+// Persists the company's name/industry/specialization/work-type/about.
+async function persistCompanyProfile() {
+  if (!companyId) return;
+  await sb.from("companies").update({
+    name: companyProfileState.name,
+    industry: companyProfileState.industry,
+    specialization: companyProfileState.specialization,
+    work_type: companyProfileState.workType,
+    about: companyProfileState.about,
+  }).eq("id", companyId);
+  companyName = companyProfileState.name;
+  state.hasCompanyProfile = true;
+}
+
+const postingFormState = { id: null, role: "", location: "", summary: "", description: "", tags: [], tagInput: "" };
+
+function resetPostingForm(existing) {
+  if (existing) {
+    postingFormState.id = existing.id;
+    postingFormState.role = existing.role;
+    postingFormState.location = existing.location;
+    postingFormState.summary = existing.summary || "";
+    postingFormState.description = existing.description || "";
+    postingFormState.tags = [...existing.tags];
+  } else {
+    postingFormState.id = null;
+    postingFormState.role = "";
+    postingFormState.location = "";
+    postingFormState.summary = "";
+    postingFormState.description = "";
+    postingFormState.tags = [];
+  }
+  postingFormState.tagInput = "";
+}
+
+async function savePostingForm() {
+  const payload = {
+    company: companyName,
+    role: postingFormState.role,
+    location: postingFormState.location,
+    summary: postingFormState.summary,
+    description: postingFormState.description,
+    tags: postingFormState.tags,
+    logo: companyName.trim().charAt(0).toUpperCase() || "?",
+    company_id: companyId,
+  };
+  if (postingFormState.id) {
+    await sb.from("postings").update(payload).eq("id", postingFormState.id);
+  } else {
+    await sb.from("postings").insert(payload);
+  }
+  await loadCompanyListings();
+  state.companyView = "list";
+  render();
+}
+
+async function deleteCompanyPosting(id) {
+  await sb.from("postings").delete().eq("id", id);
+  await loadCompanyListings();
+  render();
+}
 
 // ---------------------------------------------------------
 // Global app state
 // ---------------------------------------------------------
 const state = {
+  session: null,          // { userId, role: "student" | "company" }
+  hasCompanyProfile: false,
+  companyView: "list",    // list | form | profile  (company dashboard sub-view)
   hasProfile: false,
   activeTab: "home", // home | matches | profile | notifications
   selectedPostingId: null,
   appliedIds: new Set(),
-  savedIds: new Set(["2", "3"]),
+  savedIds: new Set(),
   homeFilter: "All",
   showHomeFilter: false,
   showQuiz: false,
+  matchScores: {}, // { postingId: { score, baseline } } — from recomputeMatches()
 };
 
 const contentEl = document.getElementById("app-content");
 
 function render() {
   contentEl.innerHTML = "";
+
+  if (!state.session) {
+    contentEl.appendChild(renderAuthScreen());
+    return;
+  }
+
+  if (state.session.role === "company") {
+    if (!state.hasCompanyProfile) {
+      contentEl.appendChild(renderCompanyOnboardingScreen());
+      return;
+    }
+    contentEl.appendChild(renderCompanyApp());
+    return;
+  }
 
   if (!state.hasProfile) {
     contentEl.appendChild(renderOnboardingScreen());
@@ -143,8 +353,595 @@ function hexAlpha(hex, alpha) {
 }
 
 // ===========================================================
-// Onboarding Screen
+// Matching Engine — TF-IDF vectorization + Cosine Similarity
+// (content-based filtering, recomputed in a batch step rather
+// than on every keystroke, per the algorithmic design doc)
 // ===========================================================
+const STOPWORDS = new Set([
+  "a","an","and","the","for","to","of","in","on","with","is","are",
+  "this","that","i","you","we","our","your","be","as","it","or","at",
+]);
+
+function tokenize(text) {
+  return (text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9+#.]+/)
+    .filter((t) => t && !STOPWORDS.has(t));
+}
+
+// ---------------------------------------------------------
+// Domain keyword groups — lets related-but-different words count
+// as compatible (e.g. "IT" ~ "debugging"/"troubleshooting"/"helpdesk",
+// "machine learning" ~ "data analysis"/"databases"/"servers").
+// Any text mentioning a word from a group also earns that group's
+// tag, so two texts using different words from the same group still
+// score similar in the TF-IDF vectors.
+// ---------------------------------------------------------
+const KEYWORD_GROUPS = {
+  Engineering: [
+    "it", "software", "developer", "development", "engineer", "engineering",
+    "programming", "coding", "code", "debugging", "debug", "troubleshooting",
+    "troubleshoot", "helpdesk", "networks", "network", "servers", "server",
+    "systems", "system", "support", "technical", "infrastructure", "hardware",
+    "react", "javascript", "typescript", "flutter", "mobile", "web", "app",
+    "git", "api", "apis",
+  ],
+  Data: [
+    "data", "analytics", "analysis", "analyst", "machine", "learning", "ml",
+    "statistics", "statistical", "sql", "database", "databases", "reporting",
+    "insights", "bi", "python", "pandas", "etl", "dashboards", "tableau",
+    "modeling", "algorithms",
+  ],
+  Design: [
+    "design", "ui", "ux", "user", "interface", "experience", "figma",
+    "prototyping", "prototype", "visual", "creative", "graphics", "canvas",
+    "css", "layout", "branding",
+  ],
+  Business: [
+    "business", "operations", "ops", "management", "manager", "coordination",
+    "coordinator", "administrative", "admin", "planning", "process", "processes",
+    "logistics", "sales", "marketing", "finance", "strategy", "project",
+  ],
+};
+
+// Reverse lookup: word -> group tag(s)
+const WORD_TO_GROUPS = {};
+Object.entries(KEYWORD_GROUPS).forEach(([group, words]) => {
+  words.forEach((w) => {
+    if (!WORD_TO_GROUPS[w]) WORD_TO_GROUPS[w] = [];
+    WORD_TO_GROUPS[w].push(group);
+  });
+});
+
+// Expands a token list with group tags for any domain keyword found,
+// so related vocabulary (not just exact words) counts toward similarity.
+function expandWithSynonyms(tokens) {
+  const expanded = [...tokens];
+  tokens.forEach((t) => {
+    const groups = WORD_TO_GROUPS[t];
+    if (groups) groups.forEach((g) => expanded.push(`_group_${g.toLowerCase()}`));
+  });
+  return expanded;
+}
+
+function postingText(p) {
+  return [p.role, p.tags.join(" "), p.description, p.companyIndustry, p.companySpecialization, p.companyAbout].join(" ");
+}
+
+function profileText(profile) {
+  return [profile.skills.join(" "), profile.interests, profile.program].join(" ");
+}
+
+// Step 1: TF-IDF vectorization — converts skill/requirement text into
+// comparable numeric vectors across the profile + all postings.
+function buildTFIDFVectors(tokenDocs) {
+  const df = {};
+  tokenDocs.forEach((doc) => {
+    new Set(doc).forEach((term) => { df[term] = (df[term] || 0) + 1; });
+  });
+
+  const N = tokenDocs.length;
+  const idf = {};
+  Object.keys(df).forEach((term) => {
+    idf[term] = Math.log((N + 1) / (df[term] + 1)) + 1; // smoothed idf
+  });
+
+  return tokenDocs.map((doc) => {
+    const tf = {};
+    doc.forEach((t) => { tf[t] = (tf[t] || 0) + 1; });
+    const vec = {};
+    Object.keys(tf).forEach((t) => {
+      vec[t] = (tf[t] / doc.length) * idf[t];
+    });
+    return vec;
+  });
+}
+
+// Step 2: Cosine similarity — scores fit between the student vector
+// and each posting vector. Content-based filtering, reliable on
+// small datasets like this one.
+function cosineSimilarity(vecA, vecB) {
+  let dot = 0, magA = 0, magB = 0;
+  const keys = new Set([...Object.keys(vecA), ...Object.keys(vecB)]);
+  keys.forEach((k) => {
+    const a = vecA[k] || 0;
+    const b = vecB[k] || 0;
+    dot += a * b;
+    magA += a * a;
+    magB += b * b;
+  });
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+// Simple keyword-overlap baseline, used only to sanity-check the
+// TF-IDF + cosine ranking quality against a naive approach.
+function keywordBaselineScore(profileTokens, postingTokens) {
+  const pSet = new Set(profileTokens);
+  const uniquePosting = new Set(postingTokens);
+  if (uniquePosting.size === 0) return 0;
+  let overlap = 0;
+  uniquePosting.forEach((t) => { if (pSet.has(t)) overlap += 1; });
+  return overlap / uniquePosting.size;
+}
+
+// Step 3: Batch recompute — run when the profile changes (onboarding
+// save, profile save), not on every render, to keep things fast/simple.
+function recomputeMatches() {
+  const profileTokens = expandWithSynonyms(tokenize(profileText(profileState)));
+  const postingTokenDocs = POSTINGS.map((p) => expandWithSynonyms(tokenize(postingText(p))));
+  const allDocs = [profileTokens, ...postingTokenDocs];
+
+  const vectors = buildTFIDFVectors(allDocs);
+  const profileVec = vectors[0];
+
+  POSTINGS.forEach((p, i) => {
+    const postingVec = vectors[i + 1];
+    const sim = cosineSimilarity(profileVec, postingVec);
+    const baseline = keywordBaselineScore(profileTokens, postingTokenDocs[i]);
+    state.matchScores[p.id] = {
+      score: Math.max(Math.round(sim * 100), 5), // floor so nothing reads 0%
+      baseline: Math.round(baseline * 100),
+    };
+  });
+}
+
+function getFitScore(id) {
+  const entry = state.matchScores[id];
+  return entry ? entry.score : 50;
+}
+
+// ===========================================================
+// Auth Screen (student / company sign up + login)
+// ===========================================================
+function renderAuthScreen() {
+  const root = el("div", "flex:1;overflow-y:auto;background:#FAFAFA;display:flex;flex-direction:column;padding:0 24px;");
+
+  const top = el("div", "padding-top:48px;margin-bottom:28px;");
+  const brand = el("div", "display:inline-flex;align-items:center;gap:6px;margin-bottom:24px;");
+  const logoBox = el("div", "width:28px;height:28px;border-radius:8px;background:#1D9E75;display:flex;align-items:center;justify-content:center;");
+  logoBox.innerHTML = '<span style="font-size:14px;font-weight:700;color:#FFF;">S</span>';
+  const brandName = el("span", "font-size:17px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;");
+  brandName.textContent = "SkillMatch";
+  brand.appendChild(logoBox);
+  brand.appendChild(brandName);
+  const h1 = el("h1", "font-size:24px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 4px;");
+  h1.textContent = authState.mode === "login" ? "Welcome back" : "Create your account";
+  top.appendChild(brand);
+  top.appendChild(h1);
+  root.appendChild(top);
+
+  // Role toggle (only relevant for sign up)
+  if (authState.mode === "signup") {
+    const roleRow = el("div", "display:flex;gap:8px;margin-bottom:18px;");
+    [["student", "I'm a Student"], ["company", "I'm a Company"]].forEach(([val, label]) => {
+      const active = authState.role === val;
+      const btn = el("button", `flex:1;padding:12px 0;border-radius:10px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:13px;font-weight:600;cursor:pointer;`);
+      btn.textContent = label;
+      btn.addEventListener("click", () => { authState.role = val; render(); });
+      roleRow.appendChild(btn);
+    });
+    root.appendChild(roleRow);
+  }
+
+  const form = el("div", "display:flex;flex-direction:column;gap:14px;");
+
+  if (authState.mode === "signup" && authState.role === "company") {
+    const nameField = el("div");
+    nameField.appendChild(labelEl("Company Name"));
+    const nameInput = el("input", inputStyleText());
+    nameInput.placeholder = "e.g. Accenture Philippines";
+    nameInput.value = authState.companyName;
+    nameInput.addEventListener("input", (e) => { authState.companyName = e.target.value; });
+    nameField.appendChild(nameInput);
+    form.appendChild(nameField);
+  }
+
+  const emailField = el("div");
+  emailField.appendChild(labelEl("Email"));
+  const emailInput = el("input", inputStyleText());
+  emailInput.type = "email";
+  emailInput.placeholder = "you@example.com";
+  emailInput.value = authState.email;
+  emailInput.addEventListener("input", (e) => { authState.email = e.target.value; });
+  emailField.appendChild(emailInput);
+  form.appendChild(emailField);
+
+  const pwField = el("div");
+  pwField.appendChild(labelEl("Password"));
+  const pwInput = el("input", inputStyleText());
+  pwInput.type = "password";
+  pwInput.placeholder = "••••••••";
+  pwInput.value = authState.password;
+  pwInput.addEventListener("input", (e) => { authState.password = e.target.value; });
+  pwField.appendChild(pwInput);
+  form.appendChild(pwField);
+
+  if (authState.error) {
+    const err = el("p", "font-size:12px;color:#DC2626;margin:0;");
+    err.textContent = authState.error;
+    form.appendChild(err);
+  }
+  if (authState.info) {
+    const info = el("p", "font-size:12px;color:#1D9E75;margin:0;");
+    info.textContent = authState.info;
+    form.appendChild(info);
+  }
+
+  const submitBtn = el("button", "width:100%;padding:15px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;letter-spacing:-0.2px;margin-top:4px;");
+  submitBtn.textContent = authState.mode === "login" ? "Log In" : "Sign Up";
+  submitBtn.addEventListener("click", () => {
+    if (authState.mode === "login") signIn();
+    else signUp();
+  });
+  form.appendChild(submitBtn);
+
+  const switchRow = el("p", "text-align:center;font-size:13px;color:#8A8A8A;margin:16px 0 32px;");
+  const switchLink = document.createElement("span");
+  switchLink.style.cssText = "color:#1D9E75;font-weight:600;cursor:pointer;";
+  if (authState.mode === "login") {
+    switchRow.append("New here? ");
+    switchLink.textContent = "Create an account";
+  } else {
+    switchRow.append("Already have an account? ");
+    switchLink.textContent = "Log in";
+  }
+  switchLink.addEventListener("click", () => {
+    authState.mode = authState.mode === "login" ? "signup" : "login";
+    authState.error = "";
+    authState.info = "";
+    render();
+  });
+  switchRow.appendChild(switchLink);
+  form.appendChild(switchRow);
+
+  root.appendChild(form);
+  return root;
+}
+
+// ===========================================================
+// Company Dashboard (post / edit / delete listings)
+// ===========================================================
+// ===========================================================
+// Company Onboarding / Edit Profile (industry, specialization, work setup)
+// ===========================================================
+const COMPANY_INDUSTRIES = [
+  "Technology", "Finance", "Telecommunications", "Retail & E-commerce",
+  "Healthcare", "Manufacturing", "Education", "Media & Entertainment", "Other",
+];
+const COMPANY_WORK_TYPES = ["On-site", "Hybrid", "Remote", "Flexible"];
+
+function renderCompanyOnboardingScreen(isEdit) {
+  const root = el("div", `flex:1;overflow-y:auto;background:#FAFAFA;display:flex;flex-direction:column;${isEdit ? "" : "padding:0 24px;"}`);
+  const container = isEdit ? el("div", "padding:0 24px 24px;") : root;
+
+  if (isEdit) {
+    const backRow = el("button", "align-self:flex-start;background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:16px 24px 0;");
+    backRow.textContent = "← Back to Dashboard";
+    backRow.addEventListener("click", () => { state.companyView = "list"; render(); });
+    root.appendChild(backRow);
+  }
+
+  if (!isEdit) {
+    const top = el("div", "padding:24px 0 0;");
+    const backRow = el("button", "background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:0;margin-bottom:16px;");
+    backRow.textContent = "← Back to Login";
+    backRow.addEventListener("click", signOut);
+    top.appendChild(backRow);
+
+    const brand = el("div", "display:inline-flex;align-items:center;gap:6px;margin-bottom:24px;");
+    const logoBox = el("div", "width:28px;height:28px;border-radius:8px;background:#1D9E75;display:flex;align-items:center;justify-content:center;");
+    logoBox.innerHTML = '<span style="font-size:14px;font-weight:700;color:#FFF;">S</span>';
+    const brandName = el("span", "font-size:17px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;");
+    brandName.textContent = "SkillMatch";
+    brand.appendChild(logoBox);
+    brand.appendChild(brandName);
+    const h1 = el("h1", "font-size:24px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;line-height:1.2;margin:0 0 6px;");
+    h1.textContent = "Build your company profile";
+    const sub = el("p", "font-size:14px;color:#8A8A8A;margin:0 0 24px;line-height:1.5;");
+    sub.textContent = "Tell students what your company does and what you hire for.";
+    top.appendChild(brand);
+    top.appendChild(h1);
+    top.appendChild(sub);
+    root.appendChild(top);
+  }
+
+  const form = el("div", "display:flex;flex-direction:column;gap:20px;");
+
+  // Company Name
+  const nameField = el("div");
+  nameField.appendChild(labelEl("Company Name"));
+  const nameInput = el("input", inputStyleText());
+  nameInput.placeholder = "e.g. Accenture Philippines";
+  nameInput.value = companyProfileState.name;
+  nameInput.addEventListener("input", (e) => { companyProfileState.name = e.target.value; });
+  nameField.appendChild(nameInput);
+  form.appendChild(nameField);
+
+  // Industry (single select)
+  const industryField = el("div");
+  industryField.appendChild(labelEl("Industry"));
+  const industryRow = el("div", "display:flex;flex-wrap:wrap;gap:8px;");
+  COMPANY_INDUSTRIES.forEach((ind) => {
+    const active = companyProfileState.industry === ind;
+    const btn = el("button", `padding:8px 14px;border-radius:20px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:12px;font-weight:${active ? 600 : 400};cursor:pointer;`);
+    btn.textContent = ind;
+    btn.addEventListener("click", () => { companyProfileState.industry = ind; render(); });
+    industryRow.appendChild(btn);
+  });
+  industryField.appendChild(industryRow);
+  form.appendChild(industryField);
+
+  // Specialization (free text)
+  const specField = el("div");
+  specField.appendChild(labelEl("Specialization"));
+  const specInput = el("input", inputStyleText());
+  specInput.placeholder = "e.g. Fintech mobile solutions, enterprise SaaS";
+  specInput.value = companyProfileState.specialization;
+  specInput.addEventListener("input", (e) => { companyProfileState.specialization = e.target.value; });
+  specField.appendChild(specInput);
+  form.appendChild(specField);
+
+  // Work setup (single select)
+  const workField = el("div");
+  workField.appendChild(labelEl("Typical Work Setup"));
+  const workRow = el("div", "display:flex;gap:8px;");
+  COMPANY_WORK_TYPES.forEach((w) => {
+    const active = companyProfileState.workType === w;
+    const btn = el("button", `flex:1;padding:10px 0;border-radius:10px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:12px;font-weight:${active ? 600 : 400};cursor:pointer;`);
+    btn.textContent = w;
+    btn.addEventListener("click", () => { companyProfileState.workType = w; render(); });
+    workRow.appendChild(btn);
+  });
+  workField.appendChild(workRow);
+  form.appendChild(workField);
+
+  // Introduction (fill-in-the-blank, no multiple choice — this is what
+  // gets matched against student descriptions via the keyword engine)
+  const aboutField = el("div");
+  aboutField.appendChild(labelEl("Introduce Your Company"));
+  const aboutHint = el("p", "font-size:12px;color:#8A8A8A;margin:-4px 0 8px;line-height:1.5;");
+  aboutHint.textContent = "In your own words: what does your company do, and what kind of work will interns/hires actually be doing?";
+  const aboutInput = el("textarea", inputStyleText() + "resize:none;line-height:1.5;");
+  aboutInput.rows = 4;
+  aboutInput.placeholder = "e.g. We're an IT services company — our interns help with servers, networks, and troubleshooting for client systems.";
+  aboutInput.value = companyProfileState.about;
+  aboutInput.addEventListener("input", (e) => { companyProfileState.about = e.target.value; });
+  aboutField.appendChild(aboutHint);
+  aboutField.appendChild(aboutInput);
+  form.appendChild(aboutField);
+
+  const saveBtn = el("button", "width:100%;padding:15px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;letter-spacing:-0.2px;margin-top:4px;margin-bottom:32px;");
+  saveBtn.textContent = isEdit ? "Save Changes" : "Save Company Profile";
+  saveBtn.addEventListener("click", async () => {
+    await persistCompanyProfile();
+    if (isEdit) state.companyView = "list";
+    render();
+  });
+  form.appendChild(saveBtn);
+
+  container.appendChild(form);
+  if (isEdit) root.appendChild(container);
+  return root;
+}
+
+function renderCompanyApp() {
+  const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
+
+  const header = el("div", "display:flex;align-items:center;justify-content:space-between;padding:20px 24px 12px;flex-shrink:0;");
+  const headLeft = el("div");
+  const nameH1 = el("h1", "font-size:20px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.4px;");
+  nameH1.textContent = companyName || "Company";
+  const sub = el("p", "font-size:12px;color:#8A8A8A;margin:2px 0 0;");
+  sub.textContent = `${companyProfileState.industry || "No industry set"} · ${companyListings.length} active listing${companyListings.length === 1 ? "" : "s"}`;
+  headLeft.appendChild(nameH1);
+  headLeft.appendChild(sub);
+  const headRight = el("div", "display:flex;flex-direction:column;align-items:flex-end;gap:6px;");
+  const editProfileBtn = el("button", "background:none;border:none;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
+  editProfileBtn.textContent = "Edit Profile";
+  editProfileBtn.addEventListener("click", () => { state.companyView = "profile"; render(); });
+  const signOutBtn = el("button", "background:none;border:none;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
+  signOutBtn.textContent = "Sign Out";
+  signOutBtn.addEventListener("click", signOut);
+  headRight.appendChild(editProfileBtn);
+  headRight.appendChild(signOutBtn);
+  header.appendChild(headLeft);
+  header.appendChild(headRight);
+  root.appendChild(header);
+
+  if (state.companyView === "profile") {
+    root.appendChild(renderCompanyOnboardingScreen(true));
+    return root;
+  }
+
+  if (state.companyView === "form") {
+    root.appendChild(renderPostingForm());
+    return root;
+  }
+
+  const content = el("div", "flex:1;overflow-y:auto;padding:0 24px 20px;");
+
+  const newBtn = el("button", "width:100%;padding:13px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:16px;");
+  newBtn.textContent = "+ New Listing";
+  newBtn.addEventListener("click", () => {
+    resetPostingForm(null);
+    state.companyView = "form";
+    render();
+  });
+  content.appendChild(newBtn);
+
+  if (companyListings.length === 0) {
+    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
+    empty.textContent = "No listings yet. Post your first one!";
+    content.appendChild(empty);
+  }
+
+  companyListings.forEach((p) => {
+    const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+    const roleH3 = el("h3", "font-size:15px;font-weight:600;color:#1B1B1B;margin:0 0 4px;letter-spacing:-0.2px;");
+    roleH3.textContent = p.role;
+    const locP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 12px;");
+    locP.textContent = p.location;
+
+    const tagsRow = el("div", "display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px;");
+    p.tags.forEach((t) => {
+      const chip = el("span", "background:#F4F4F4;color:#1B1B1B;font-size:11px;padding:3px 9px;border-radius:20px;");
+      chip.textContent = t;
+      tagsRow.appendChild(chip);
+    });
+
+    const actionsRow = el("div", "display:flex;gap:8px;");
+    const editBtn = el("button", "flex:1;padding:9px 0;background:#F0F0F0;border:none;border-radius:10px;color:#1B1B1B;font-size:12px;font-weight:600;cursor:pointer;");
+    editBtn.textContent = "Edit";
+    editBtn.addEventListener("click", () => {
+      resetPostingForm(p);
+      state.companyView = "form";
+      render();
+    });
+    const delBtn = el("button", "flex:1;padding:9px 0;background:#FFF0F0;border:none;border-radius:10px;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;");
+    delBtn.textContent = "Delete";
+    delBtn.addEventListener("click", () => {
+      if (confirm(`Delete "${p.role}"? This can't be undone.`)) deleteCompanyPosting(p.id);
+    });
+    actionsRow.appendChild(editBtn);
+    actionsRow.appendChild(delBtn);
+
+    card.appendChild(roleH3);
+    card.appendChild(locP);
+    card.appendChild(tagsRow);
+    card.appendChild(actionsRow);
+    content.appendChild(card);
+  });
+
+  root.appendChild(content);
+  return root;
+}
+
+function renderPostingForm() {
+  const wrap = el("div", "flex:1;overflow-y:auto;padding:0 24px 24px;display:flex;flex-direction:column;gap:16px;");
+
+  const backRow = el("button", "align-self:flex-start;background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:0;margin-bottom:-6px;");
+  backRow.textContent = "← Back to listings";
+  backRow.addEventListener("click", () => { state.companyView = "list"; render(); });
+  wrap.appendChild(backRow);
+
+  const roleField = el("div");
+  roleField.appendChild(labelEl("Role Title"));
+  const roleInput = el("input", inputStyleText());
+  roleInput.placeholder = "e.g. Frontend Engineering Intern";
+  roleInput.value = postingFormState.role;
+  roleInput.addEventListener("input", (e) => { postingFormState.role = e.target.value; });
+  roleField.appendChild(roleInput);
+  wrap.appendChild(roleField);
+
+  const locField = el("div");
+  locField.appendChild(labelEl("Location"));
+  const locInput = el("input", inputStyleText());
+  locInput.placeholder = "e.g. BGC, Taguig · On-site";
+  locInput.value = postingFormState.location;
+  locInput.addEventListener("input", (e) => { postingFormState.location = e.target.value; });
+  locField.appendChild(locInput);
+  wrap.appendChild(locField);
+
+  const sumField = el("div");
+  sumField.appendChild(labelEl("Short Summary"));
+  const sumInput = el("input", inputStyleText());
+  sumInput.placeholder = "One line shown on the feed card";
+  sumInput.value = postingFormState.summary;
+  sumInput.addEventListener("input", (e) => { postingFormState.summary = e.target.value; });
+  sumField.appendChild(sumInput);
+  wrap.appendChild(sumField);
+
+  const descField = el("div");
+  descField.appendChild(labelEl("Full Description"));
+  const descInput = el("textarea", inputStyleText() + "resize:none;line-height:1.5;");
+  descInput.rows = 4;
+  descInput.value = postingFormState.description;
+  descInput.addEventListener("input", (e) => { postingFormState.description = e.target.value; });
+  descField.appendChild(descInput);
+  wrap.appendChild(descField);
+
+  // Required competencies (tag chips, same pattern as onboarding skills)
+  const tagsField = el("div");
+  tagsField.appendChild(labelEl("Required Competencies"));
+  const tagsBox = el("div", "background:#FFFFFF;border-radius:12px;border:1.5px solid #E8E8E8;padding:10px 12px;");
+  const chipRow = el("div", `display:flex;flex-wrap:wrap;gap:6px;margin-bottom:${postingFormState.tags.length ? "8px" : "0"};`);
+  postingFormState.tags.forEach((tag) => {
+    const chip = el("span", "display:inline-flex;align-items:center;gap:4px;background:#E8F7F2;color:#1D9E75;font-size:12px;font-weight:500;padding:4px 10px;border-radius:20px;");
+    chip.appendChild(document.createTextNode(tag));
+    const rm = el("button", "background:none;border:none;cursor:pointer;color:#1D9E75;padding:0;font-size:14px;line-height:1;");
+    rm.textContent = "×";
+    rm.addEventListener("click", () => {
+      postingFormState.tags = postingFormState.tags.filter((t) => t !== tag);
+      render();
+    });
+    chip.appendChild(rm);
+    chipRow.appendChild(chip);
+  });
+  tagsBox.appendChild(chipRow);
+
+  const tagInputRow = el("div", "display:flex;align-items:center;gap:6px;");
+  const tagInput = el("input", "flex:1;border:none;outline:none;background:transparent;font-size:13px;color:#1B1B1B;");
+  tagInput.placeholder = "Add a skill/tag...";
+  tagInput.value = postingFormState.tagInput;
+  tagInput.id = "posting-tag-input";
+  function addTag(v) {
+    const t = (v || "").trim();
+    if (t && !postingFormState.tags.includes(t)) postingFormState.tags.push(t);
+    postingFormState.tagInput = "";
+    render();
+    const inp = document.getElementById("posting-tag-input");
+    if (inp) inp.focus();
+  }
+  tagInput.addEventListener("input", (e) => {
+    postingFormState.tagInput = e.target.value;
+    render();
+    const inp = document.getElementById("posting-tag-input");
+    if (inp) { inp.focus(); inp.selectionStart = inp.selectionEnd = inp.value.length; }
+  });
+  tagInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addTag(tagInput.value); }
+  });
+  const addTagBtn = el("button", "width:24px;height:24px;border-radius:6px;background:#1D9E75;border:none;cursor:pointer;color:#FFF;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;flex-shrink:0;");
+  addTagBtn.textContent = "+";
+  addTagBtn.addEventListener("click", () => addTag(tagInput.value));
+  tagInputRow.appendChild(tagInput);
+  tagInputRow.appendChild(addTagBtn);
+  tagsBox.appendChild(tagInputRow);
+  tagsField.appendChild(tagsBox);
+  wrap.appendChild(tagsField);
+
+  const saveBtn = el("button", "width:100%;padding:15px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;letter-spacing:-0.2px;");
+  saveBtn.textContent = postingFormState.id ? "Save Changes" : "Post Listing";
+  saveBtn.addEventListener("click", () => {
+    if (!postingFormState.role.trim() || !postingFormState.location.trim()) return;
+    savePostingForm();
+  });
+  wrap.appendChild(saveBtn);
+
+  return wrap;
+}
+
 const SKILL_SUGGESTIONS = [
   "Web Development", "Python", "React", "SQL", "UI/UX Design",
   "Data Analysis", "Java", "Node.js", "Flutter", "Machine Learning",
@@ -163,6 +960,11 @@ function renderOnboardingScreen() {
   const root = el("div", "flex:1;overflow-y:auto;background:#FAFAFA;display:flex;flex-direction:column;");
 
   const top = el("div", "padding:24px 24px 0;");
+
+  const backRow = el("button", "background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:0;margin-bottom:16px;");
+  backRow.textContent = "← Back to Login";
+  backRow.addEventListener("click", signOut);
+  top.appendChild(backRow);
 
   const brand = el("div", "display:inline-flex;align-items:center;gap:6px;margin-bottom:24px;");
   const logoBox = el("div", "width:28px;height:28px;border-radius:8px;background:#1D9E75;display:flex;align-items:center;justify-content:center;");
@@ -310,6 +1112,12 @@ function renderOnboardingScreen() {
   saveBtn.textContent = "Save Profile";
   saveBtn.addEventListener("click", () => {
     state.hasProfile = true;
+    profileState.skills = [...onboardingState.skills];
+    profileState.interests = onboardingState.interests || profileState.interests;
+    profileState.program = onboardingState.program || profileState.program;
+    profileState.yearLevel = onboardingState.yearLevel || profileState.yearLevel;
+    recomputeMatches();
+    persistProfile();
     startQuiz();
   });
   form.appendChild(saveBtn);
@@ -336,17 +1144,18 @@ const HOME_FILTERS = ["All", "On-site", "Hybrid", "Remote"];
 function renderHomeScreen() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
 
-  const filtered =
+  const filtered = (
     state.homeFilter === "All"
       ? POSTINGS
-      : POSTINGS.filter((p) => p.location.toLowerCase().includes(state.homeFilter.toLowerCase()));
+      : POSTINGS.filter((p) => p.location.toLowerCase().includes(state.homeFilter.toLowerCase()))
+  ).slice().sort((a, b) => getFitScore(b.id) - getFitScore(a.id));
 
   const header = el("div", "padding:20px 24px 0;background:#FAFAFA;");
   const headerTop = el("div", "display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px;");
 
   const greetBlock = el("div");
   const greet = el("p", "font-size:13px;color:#8A8A8A;margin:0;margin-bottom:2px;");
-  greet.textContent = "Good morning, Marco 👋";
+  greet.textContent = `Good morning 👋`;
   const title = el("h1", "font-size:22px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.5px;");
   title.textContent = "Top Matches";
   greetBlock.appendChild(greet);
@@ -401,7 +1210,8 @@ function renderHomeScreen() {
 function renderPostingCard(posting, rank) {
   const applied = state.appliedIds.has(posting.id);
   const saved = state.savedIds.has(posting.id);
-  const sColor = scoreColor(posting.fitScore, false);
+  const fitScore = getFitScore(posting.id);
+  const sColor = scoreColor(fitScore, false);
 
   const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04);cursor:pointer;position:relative;");
   card.addEventListener("click", () => {
@@ -425,7 +1235,7 @@ function renderPostingCard(posting, rank) {
   const companyName = el("span", "font-size:11px;color:#8A8A8A;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
   companyName.textContent = posting.company;
   const fitBadge = el("div", `display:inline-flex;align-items:center;gap:3px;background:${hexAlpha(sColor, "18")};color:${sColor};font-size:11px;font-weight:700;padding:3px 8px;border-radius:20px;flex-shrink:0;margin-left:8px;`);
-  fitBadge.innerHTML = `<div style="width:5px;height:5px;border-radius:50%;background:${sColor};"></div>${posting.fitScore}% fit`;
+  fitBadge.innerHTML = `<div style="width:5px;height:5px;border-radius:50%;background:${sColor};"></div>${fitScore}% fit`;
   topRow.appendChild(companyName);
   topRow.appendChild(fitBadge);
 
@@ -464,15 +1274,26 @@ function renderPostingCard(posting, rank) {
 }
 
 function toggleSave(id) {
-  if (state.savedIds.has(id)) state.savedIds.delete(id);
+  const wasSaved = state.savedIds.has(id);
+  if (wasSaved) state.savedIds.delete(id);
   else state.savedIds.add(id);
   render();
+
+  if (!studentId) return;
+  if (wasSaved) {
+    sb.from("saved_postings").delete().eq("student_id", studentId).eq("posting_id", id);
+  } else {
+    sb.from("saved_postings").upsert({ student_id: studentId, posting_id: id }, { onConflict: "student_id,posting_id" });
+  }
 }
 
 function applyToPosting(id) {
   state.appliedIds.add(id);
   state.selectedPostingId = null;
   render();
+
+  if (!studentId) return;
+  sb.from("applications").upsert({ student_id: studentId, posting_id: id }, { onConflict: "student_id,posting_id" });
 }
 
 // ===========================================================
@@ -481,7 +1302,8 @@ function applyToPosting(id) {
 function renderPostingDetailScreen(posting) {
   const applied = state.appliedIds.has(posting.id);
   const saved = state.savedIds.has(posting.id);
-  const sColor = scoreColor(posting.fitScore, true);
+  const fitScore = getFitScore(posting.id);
+  const sColor = scoreColor(fitScore, true);
 
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
 
@@ -532,7 +1354,7 @@ function renderPostingDetailScreen(posting) {
   fitBadge.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="${sColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M22 11.08V12a10 10 0 11-5.93-9.14" />
       <polyline points="22 4 12 14.01 9 11.01" />
-    </svg>${posting.fitScore}% Skill Match`;
+    </svg>${fitScore}% Skill Match`;
   const locBadge = el("span", "font-size:11px;color:#ABABAB;background:#F4F4F4;padding:5px 10px;border-radius:20px;");
   locBadge.textContent = posting.location;
   row2.appendChild(fitBadge);
@@ -650,7 +1472,7 @@ function renderMatchesScreen() {
       topRow.appendChild(statusSpan);
 
       const subP = el("p", "margin:0;font-size:12px;color:#8A8A8A;");
-      subP.textContent = `${match.company} · ${match.fitScore}% fit`;
+      subP.textContent = `${match.company} · ${getFitScore(match.id)}% fit`;
 
       info.appendChild(topRow);
       info.appendChild(subP);
@@ -678,12 +1500,11 @@ const ALL_SKILLS = [
 ];
 
 const profileState = {
-  skills: ["Web Development", "Python", "React", "TypeScript", "SQL"],
+  skills: [],
   skillInput: "",
-  interests:
-    "Interested in full-stack development and fintech. Looking for a startup environment where I can work on real production systems from day one.",
-  program: "BS Computer Science",
-  yearLevel: "3rd",
+  interests: "",
+  program: "",
+  yearLevel: "",
   saved: false,
 };
 
@@ -694,12 +1515,12 @@ function renderProfileScreen() {
   const header = el("div", "padding:20px 24px 16px;flex-shrink:0;");
   const headRow = el("div", "display:flex;align-items:center;gap:14px;margin-bottom:20px;");
   const avatar = el("div", "width:52px;height:52px;border-radius:16px;background:#1D9E75;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#FFFFFF;");
-  avatar.textContent = "M";
+  avatar.textContent = (state.session && state.session.email ? state.session.email.charAt(0) : "S").toUpperCase();
   const nameBlock = el("div");
   const nameH2 = el("h2", "margin:0;font-size:18px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;");
-  nameH2.textContent = "Marco Reyes";
+  nameH2.textContent = state.session && state.session.email ? state.session.email : "My Profile";
   const progP = el("p", "margin:0;font-size:12px;color:#8A8A8A;");
-  progP.textContent = `${profileState.program} · ${profileState.yearLevel} Year`;
+  progP.textContent = `${profileState.program || "No program set"} · ${profileState.yearLevel || "—"} Year`;
   nameBlock.appendChild(nameH2);
   nameBlock.appendChild(progP);
   headRow.appendChild(avatar);
@@ -827,6 +1648,8 @@ function renderProfileScreen() {
   saveBtn.textContent = profileState.saved ? "Changes Saved" : "Save Changes";
   saveBtn.addEventListener("click", () => {
     profileState.saved = true;
+    recomputeMatches();
+    persistProfile();
     render();
   });
   content.appendChild(saveBtn);
@@ -835,6 +1658,11 @@ function renderProfileScreen() {
   quizBtn.textContent = "Take Career Quiz →";
   quizBtn.addEventListener("click", startQuiz);
   content.appendChild(quizBtn);
+
+  const signOutBtn = el("button", "width:100%;padding:14px;background:none;border:none;color:#DC2626;font-size:13px;font-weight:600;cursor:pointer;margin-top:4px;");
+  signOutBtn.textContent = "Sign Out";
+  signOutBtn.addEventListener("click", signOut);
+  content.appendChild(signOutBtn);
 
   root.appendChild(content);
   return root;
@@ -953,83 +1781,64 @@ function renderNotificationsScreen() {
 }
 
 // ===========================================================
-// Career Quiz
+// Career Quiz — fill-in-the-blank (no multiple choice). Answers
+// are combined and matched against domain keyword groups, then
+// folded into the student's profile so real posting matches
+// (via the TF-IDF engine) reflect it too.
 // ===========================================================
 const QUIZ_QUESTIONS = [
-  {
-    q: "Which task sounds most fun?",
-    options: [
-      { t: "Building an app feature", tag: "Engineering" },
-      { t: "Finding patterns in a spreadsheet", tag: "Data" },
-      { t: "Designing a clean UI screen", tag: "Design" },
-      { t: "Planning a team's workflow", tag: "Business" },
-    ],
-  },
-  {
-    q: "Pick a tool you'd rather master:",
-    options: [
-      { t: "React / Flutter", tag: "Engineering" },
-      { t: "SQL / Tableau", tag: "Data" },
-      { t: "Figma", tag: "Design" },
-      { t: "Excel / Notion", tag: "Business" },
-    ],
-  },
-  {
-    q: "In a group project, you're usually the one who:",
-    options: [
-      { t: "Writes the code", tag: "Engineering" },
-      { t: "Crunches the numbers", tag: "Data" },
-      { t: "Makes it look good", tag: "Design" },
-      { t: "Keeps everyone organized", tag: "Business" },
-    ],
-  },
-  {
-    q: "Which problem interests you more?",
-    options: [
-      { t: "Why is this app slow?", tag: "Engineering" },
-      { t: "Why did sales drop last month?", tag: "Data" },
-      { t: "Why is this screen confusing?", tag: "Design" },
-      { t: "Why is this process inefficient?", tag: "Business" },
-    ],
-  },
-  {
-    q: "Pick a dream first job:",
-    options: [
-      { t: "Software Engineer", tag: "Engineering" },
-      { t: "Data Analyst", tag: "Data" },
-      { t: "UI/UX Designer", tag: "Design" },
-      { t: "Business/Ops Associate", tag: "Business" },
-    ],
-  },
+  { q: "What kind of work do you want to do after graduating?", placeholder: "e.g. I want to focus on the IT department, fixing systems and helping people troubleshoot problems." },
+  { q: "What skills or tools do you enjoy using the most?", placeholder: "e.g. debugging code, working with servers and databases, SQL, Figma..." },
+  { q: "Describe a task or project you'd love to work on.", placeholder: "e.g. Building a dashboard that analyzes sales data with machine learning." },
 ];
 
 const FIELD_INFO = {
-  Engineering: { label: "Software Engineering", office: "Engineering / Product teams", desc: "You like building things that work. Look at software, mobile, or web dev roles." },
-  Data: { label: "Data & Analytics", office: "Data / Analytics office", desc: "You like finding signal in numbers. Look at data analyst or BI roles." },
-  Design: { label: "UI/UX Design", office: "Design / Product team", desc: "You care about how things look and feel. Look at product design roles." },
-  Business: { label: "Business Operations", office: "Business/Ops or PM office", desc: "You like organizing people and process. Look at ops, PM, or coordinator roles." },
+  Engineering: { label: "Software Engineering / IT", office: "Engineering / IT Support office", desc: "Your answers lean toward building, fixing, and supporting technical systems. Look at software, mobile, or IT/helpdesk roles." },
+  Data: { label: "Data & Analytics", office: "Data / Analytics office", desc: "Your answers lean toward numbers and patterns. Look at data analyst, BI, or ML-adjacent roles." },
+  Design: { label: "UI/UX Design", office: "Design / Product team", desc: "Your answers lean toward how things look and feel. Look at product or UI/UX design roles." },
+  Business: { label: "Business Operations", office: "Business/Ops or PM office", desc: "Your answers lean toward organizing people and process. Look at ops, PM, or coordinator roles." },
 };
 
-// Map each posting to the quiz field it best fits (by id)
-const POSTING_FIELD = { "1": "Engineering", "2": "Data", "3": "Engineering", "4": "Data", "5": "Design" };
-
-const quizState = { index: 0, tallies: {}, done: false };
+const quizState = { index: 0, answers: [], done: false, resultField: null };
 
 function startQuiz() {
   quizState.index = 0;
-  quizState.tallies = {};
+  quizState.answers = QUIZ_QUESTIONS.map(() => "");
   quizState.done = false;
+  quizState.resultField = null;
   state.showQuiz = true;
   render();
 }
 
-function answerQuiz(tag) {
-  quizState.tallies[tag] = (quizState.tallies[tag] || 0) + 1;
+// Scores the combined free-text answers against each domain keyword
+// group (with synonym expansion) and picks the strongest match.
+function scoreQuizAnswers(combinedText) {
+  const expanded = expandWithSynonyms(tokenize(combinedText));
+  const counts = {};
+  Object.keys(KEYWORD_GROUPS).forEach((group) => {
+    counts[group] = expanded.filter((t) => t === `_group_${group.toLowerCase()}`).length;
+  });
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  return sorted[0][1] > 0 ? sorted[0][0] : "Engineering"; // sensible default if nothing matched
+}
+
+function submitQuizAnswer(text) {
+  quizState.answers[quizState.index] = text;
   if (quizState.index < QUIZ_QUESTIONS.length - 1) {
     quizState.index += 1;
-  } else {
-    quizState.done = true;
+    render();
+    return;
   }
+  quizState.done = true;
+  const combined = quizState.answers.join(" ");
+  quizState.resultField = scoreQuizAnswers(combined);
+
+  // Fold the quiz answers into the student's profile so the main
+  // TF-IDF matching engine (postings feed, fit %) reflects it too.
+  const existing = profileState.interests || "";
+  profileState.interests = existing ? `${existing} ${combined}` : combined;
+  recomputeMatches();
+  persistProfile();
   render();
 }
 
@@ -1037,12 +1846,18 @@ function renderQuizScreen() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
 
   const header = el("div", "display:flex;align-items:center;gap:10px;padding:16px 24px 12px;flex-shrink:0;");
-  if (state.activeTab === "profile" || quizState.done) {
-    const backBtn = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#1B1B1B;");
-    backBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
-    backBtn.addEventListener("click", () => { state.showQuiz = false; render(); });
-    header.appendChild(backBtn);
-  }
+  const backBtn = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#1B1B1B;");
+  backBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
+  backBtn.addEventListener("click", () => {
+    if (!quizState.done && quizState.index > 0) {
+      quizState.index -= 1; // step back a question
+      render();
+    } else {
+      state.showQuiz = false; // exit the quiz entirely
+      render();
+    }
+  });
+  header.appendChild(backBtn);
   const titleSpan = el("span", "font-size:15px;font-weight:600;color:#1B1B1B;");
   titleSpan.textContent = "Career Quiz";
   header.appendChild(titleSpan);
@@ -1060,21 +1875,27 @@ function renderQuizScreen() {
 
     const progress = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 8px;");
     progress.textContent = `Question ${quizState.index + 1} of ${QUIZ_QUESTIONS.length}`;
-    const qTitle = el("h2", "font-size:19px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;margin:0 0 20px;");
+    const qTitle = el("h2", "font-size:19px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;margin:0 0 16px;");
     qTitle.textContent = q.q;
     content.appendChild(progress);
     content.appendChild(qTitle);
 
-    const optWrap = el("div", "display:flex;flex-direction:column;gap:10px;");
-    q.options.forEach((opt) => {
-      const btn = el("button", "text-align:left;padding:14px 16px;background:#FFFFFF;border:1.5px solid #E8E8E8;border-radius:12px;font-size:14px;color:#1B1B1B;cursor:pointer;");
-      btn.textContent = opt.t;
-      btn.addEventListener("click", () => answerQuiz(opt.tag));
-      optWrap.appendChild(btn);
+    const textarea = el("textarea", inputStyleText() + "resize:none;line-height:1.5;min-height:120px;");
+    textarea.placeholder = q.placeholder;
+    textarea.value = quizState.answers[quizState.index] || "";
+    textarea.id = "quiz-answer-input";
+    textarea.addEventListener("input", (e) => { quizState.answers[quizState.index] = e.target.value; });
+    content.appendChild(textarea);
+
+    const nextBtn = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;");
+    nextBtn.textContent = quizState.index < QUIZ_QUESTIONS.length - 1 ? "Next" : "See My Result";
+    nextBtn.addEventListener("click", () => {
+      const val = document.getElementById("quiz-answer-input").value;
+      submitQuizAnswer(val);
     });
-    content.appendChild(optWrap);
+    content.appendChild(nextBtn);
   } else {
-    const top = Object.entries(quizState.tallies).sort((a, b) => b[1] - a[1])[0][0];
+    const top = quizState.resultField;
     const info = FIELD_INFO[top];
 
     const badge = el("div", "width:56px;height:56px;border-radius:16px;background:#E8F7F2;display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:16px;");
@@ -1094,8 +1915,8 @@ function renderQuizScreen() {
     content.appendChild(officeP);
     content.appendChild(descP);
 
-    // Matching postings for this field
-    const matches = POSTINGS.filter((p) => POSTING_FIELD[p.id] === top);
+    // Top real postings by the (now quiz-updated) fit score
+    const matches = [...POSTINGS].sort((a, b) => getFitScore(b.id) - getFitScore(a.id)).slice(0, 3);
     if (matches.length > 0) {
       const matchLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 10px;");
       matchLabel.textContent = "Postings for you";
@@ -1180,6 +2001,13 @@ function renderBottomNav() {
 }
 
 // ---------------------------------------------------------
-// Init
+// Init — always land on the login page first, even if a session
+// was previously persisted (no silent auto-login on reopen).
 // ---------------------------------------------------------
-render();
+contentEl.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ABABAB;font-size:13px;">Loading SkillMatch…</div>`;
+sb.auth.signOut().finally(() => {
+  studentId = null;
+  companyId = null;
+  state.session = null;
+  render();
+});
