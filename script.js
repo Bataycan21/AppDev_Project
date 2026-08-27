@@ -75,9 +75,10 @@ async function createProfileAfterSignup(userId, role, companyName) {
   await sb.from("profiles").insert({ id: userId, role });
   if (role === "student") {
     await sb.from("students").insert({ id: userId, name: "" });
-  } else {
+  } else if (role === "company") {
     await sb.from("companies").insert({ id: userId, name: companyName, logo: (companyName || "?").trim().charAt(0).toUpperCase() });
   }
+  // coordinator: no extra row needed, profiles.role is enough
 }
 
 async function signIn() {
@@ -96,8 +97,17 @@ async function signOut() {
   companyId = null;
   state.session = null;
   state.hasProfile = false;
+  state.hasCompanyProfile = false;
   state.activeTab = "home";
   state.selectedPostingId = null;
+  state.companyView = "list";
+  state.appliedIds = new Set();
+  state.savedIds = new Set();
+  state.applicationStatus = {};
+  companyListings = [];
+  companyApplicants = [];
+  applicantsForPostingId = null;
+  coordinatorApplications = [];
   render();
 }
 
@@ -125,6 +135,9 @@ async function routeAfterAuth() {
     companyId = user.id;
     state.session = { userId: user.id, role: "company", email: user.email };
     await loadCompanyListings();
+  } else if (role === "coordinator") {
+    state.session = { userId: user.id, role: "coordinator", email: user.email };
+    await loadCoordinatorData();
   } else {
     studentId = user.id;
     state.session = { userId: user.id, role: "student", email: user.email };
@@ -151,11 +164,15 @@ async function loadStudentData() {
     state.hasProfile = !!(s.program); // onboarding sets program, so its presence = profile completed
   }
 
-  const { data: apps } = await sb.from("applications").select("posting_id").eq("student_id", studentId);
+  const { data: apps } = await sb.from("applications").select("posting_id, status").eq("student_id", studentId);
   state.appliedIds = new Set((apps || []).map((a) => a.posting_id));
+  state.applicationStatus = {};
+  (apps || []).forEach((a) => { state.applicationStatus[a.posting_id] = a.status; });
 
   const { data: saves } = await sb.from("saved_postings").select("posting_id").eq("student_id", studentId);
   state.savedIds = new Set((saves || []).map((sv) => sv.posting_id));
+
+  await loadNotifications();
 
   recomputeMatches();
 }
@@ -176,7 +193,7 @@ async function persistProfile() {
 // ---------------------------------------------------------
 let companyName = "";
 let companyListings = [];
-const companyProfileState = { name: "", industry: "", specialization: "", workType: "", about: "" };
+const companyProfileState = { name: "", industry: "", industryInput: "", specialization: "", workType: "", about: "" };
 
 async function loadCompanyListings() {
   const { data: companyRows } = await sb.from("companies").select("*").eq("id", companyId).limit(1);
@@ -258,6 +275,53 @@ async function deleteCompanyPosting(id) {
 }
 
 // ---------------------------------------------------------
+// Company: view applicants to one of their own postings
+// ---------------------------------------------------------
+let companyApplicants = []; // [{ id, status, applied_at, student: {...} }]
+let applicantsForPostingId = null;
+
+async function loadApplicantsForPosting(postingId) {
+  applicantsForPostingId = postingId;
+  const { data } = await sb
+    .from("applications")
+    .select("id, status, applied_at, students(id, name, program, year_level, skills, interests)")
+    .eq("posting_id", postingId)
+    .order("applied_at", { ascending: false });
+  companyApplicants = (data || []).map((row) => ({
+    id: row.id,
+    status: row.status,
+    appliedAt: row.applied_at,
+    student: row.students || {},
+  }));
+}
+
+async function setApplicationStatus(applicationId, newStatus) {
+  await sb.from("applications").update({ status: newStatus }).eq("id", applicationId);
+  if (applicantsForPostingId) await loadApplicantsForPosting(applicantsForPostingId);
+  if (state.session && state.session.role === "coordinator") await loadCoordinatorData();
+  render();
+}
+
+// ---------------------------------------------------------
+// Coordinator: read-only(ish) view across all applications
+// ---------------------------------------------------------
+let coordinatorApplications = []; // [{ id, status, appliedAt, student, posting }]
+
+async function loadCoordinatorData() {
+  const { data } = await sb
+    .from("applications")
+    .select("id, status, applied_at, students(name, program, year_level, skills), postings(role, company, location)")
+    .order("applied_at", { ascending: false });
+  coordinatorApplications = (data || []).map((row) => ({
+    id: row.id,
+    status: row.status,
+    appliedAt: row.applied_at,
+    student: row.students || {},
+    posting: row.postings || {},
+  }));
+}
+
+// ---------------------------------------------------------
 // Global app state
 // ---------------------------------------------------------
 const state = {
@@ -268,6 +332,7 @@ const state = {
   activeTab: "home", // home | matches | profile | notifications
   selectedPostingId: null,
   appliedIds: new Set(),
+  applicationStatus: {}, // { postingId: status } — real status from applications table
   savedIds: new Set(),
   homeFilter: "All",
   showHomeFilter: false,
@@ -291,6 +356,11 @@ function render() {
       return;
     }
     contentEl.appendChild(renderCompanyApp());
+    return;
+  }
+
+  if (state.session.role === "coordinator") {
+    contentEl.appendChild(renderCoordinatorApp());
     return;
   }
 
@@ -334,6 +404,15 @@ function el(tag, styleText, props) {
   if (styleText) e.style.cssText = styleText;
   if (props) Object.assign(e, props);
   return e;
+}
+
+// Icon-only circular back/return arrow button (matches the one used
+// on Posting Detail / Career Quiz), for consistent "return" affordance.
+function backArrowButton(onClick) {
+  const btn = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:#1B1B1B;flex-shrink:0;");
+  btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
+  btn.addEventListener("click", onClick);
+  return btn;
 }
 
 function scoreColor(fitScore, threeStep) {
@@ -534,7 +613,7 @@ function renderAuthScreen() {
   // Role toggle (only relevant for sign up)
   if (authState.mode === "signup") {
     const roleRow = el("div", "display:flex;gap:8px;margin-bottom:18px;");
-    [["student", "I'm a Student"], ["company", "I'm a Company"]].forEach(([val, label]) => {
+    [["student", "Student"], ["company", "Company"], ["coordinator", "Coordinator"]].forEach(([val, label]) => {
       const active = authState.role === val;
       const btn = el("button", `flex:1;padding:12px 0;border-radius:10px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:13px;font-weight:600;cursor:pointer;`);
       btn.textContent = label;
@@ -627,7 +706,7 @@ function renderAuthScreen() {
 // ===========================================================
 const COMPANY_INDUSTRIES = [
   "Technology", "Finance", "Telecommunications", "Retail & E-commerce",
-  "Healthcare", "Manufacturing", "Education", "Media & Entertainment", "Other",
+  "Healthcare", "Manufacturing", "Education", "Media & Entertainment",
 ];
 const COMPANY_WORK_TYPES = ["On-site", "Hybrid", "Remote", "Flexible"];
 
@@ -636,17 +715,15 @@ function renderCompanyOnboardingScreen(isEdit) {
   const container = isEdit ? el("div", "padding:0 24px 24px;") : root;
 
   if (isEdit) {
-    const backRow = el("button", "align-self:flex-start;background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:16px 24px 0;");
-    backRow.textContent = "← Back to Dashboard";
-    backRow.addEventListener("click", () => { state.companyView = "list"; render(); });
+    const backRow = el("div", "padding:16px 24px 0;");
+    backRow.appendChild(backArrowButton(() => { state.companyView = "list"; render(); }));
     root.appendChild(backRow);
   }
 
   if (!isEdit) {
     const top = el("div", "padding:24px 0 0;");
-    const backRow = el("button", "background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:0;margin-bottom:16px;");
-    backRow.textContent = "← Back to Login";
-    backRow.addEventListener("click", signOut);
+    const backRow = el("div", "margin-bottom:16px;");
+    backRow.appendChild(backArrowButton(signOut));
     top.appendChild(backRow);
 
     const brand = el("div", "display:inline-flex;align-items:center;gap:6px;margin-bottom:24px;");
@@ -678,10 +755,11 @@ function renderCompanyOnboardingScreen(isEdit) {
   nameField.appendChild(nameInput);
   form.appendChild(nameField);
 
-  // Industry (single select)
+  // Industry (single select, with a manual type-in for anything not listed)
   const industryField = el("div");
   industryField.appendChild(labelEl("Industry"));
-  const industryRow = el("div", "display:flex;flex-wrap:wrap;gap:8px;");
+  const industryRow = el("div", "display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;");
+  const isCustomIndustry = companyProfileState.industry && !COMPANY_INDUSTRIES.includes(companyProfileState.industry);
   COMPANY_INDUSTRIES.forEach((ind) => {
     const active = companyProfileState.industry === ind;
     const btn = el("button", `padding:8px 14px;border-radius:20px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:12px;font-weight:${active ? 600 : 400};cursor:pointer;`);
@@ -689,7 +767,39 @@ function renderCompanyOnboardingScreen(isEdit) {
     btn.addEventListener("click", () => { companyProfileState.industry = ind; render(); });
     industryRow.appendChild(btn);
   });
+  if (isCustomIndustry) {
+    const customChip = el("button", "padding:8px 14px;border-radius:20px;border:none;background:#1D9E75;color:#FFFFFF;font-size:12px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;");
+    customChip.appendChild(document.createTextNode(companyProfileState.industry));
+    const clearX = el("span", "font-size:14px;line-height:1;");
+    clearX.textContent = "×";
+    customChip.appendChild(clearX);
+    customChip.addEventListener("click", () => { companyProfileState.industry = ""; render(); });
+    industryRow.appendChild(customChip);
+  }
   industryField.appendChild(industryRow);
+
+  const customIndustryRow = el("div", "display:flex;align-items:center;gap:8px;");
+  const customIndustryInput = el("input", inputStyleText() + "flex:1;");
+  customIndustryInput.placeholder = "Not listed? Type your own industry...";
+  customIndustryInput.value = companyProfileState.industryInput;
+  customIndustryInput.id = "custom-industry-input";
+  function addCustomIndustry(v) {
+    const trimmed = (v || "").trim();
+    if (trimmed) companyProfileState.industry = trimmed;
+    companyProfileState.industryInput = "";
+    render();
+  }
+  customIndustryInput.addEventListener("input", (e) => { companyProfileState.industryInput = e.target.value; });
+  customIndustryInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); addCustomIndustry(customIndustryInput.value); }
+  });
+  const addIndustryBtn = el("button", "width:38px;height:38px;border-radius:10px;background:#1D9E75;border:none;cursor:pointer;color:#FFF;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;flex-shrink:0;");
+  addIndustryBtn.textContent = "+";
+  addIndustryBtn.addEventListener("click", () => addCustomIndustry(customIndustryInput.value));
+  customIndustryRow.appendChild(customIndustryInput);
+  customIndustryRow.appendChild(addIndustryBtn);
+  industryField.appendChild(customIndustryRow);
+
   form.appendChild(industryField);
 
   // Specialization (free text)
@@ -779,6 +889,11 @@ function renderCompanyApp() {
     return root;
   }
 
+  if (state.companyView === "applicants") {
+    root.appendChild(renderApplicantsScreen());
+    return root;
+  }
+
   const content = el("div", "flex:1;overflow-y:auto;padding:0 24px 20px;");
 
   const newBtn = el("button", "width:100%;padding:13px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:16px;");
@@ -811,6 +926,13 @@ function renderCompanyApp() {
     });
 
     const actionsRow = el("div", "display:flex;gap:8px;");
+    const applicantsBtn = el("button", "flex:1;padding:9px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;");
+    applicantsBtn.textContent = "Applicants";
+    applicantsBtn.addEventListener("click", async () => {
+      await loadApplicantsForPosting(p.id);
+      state.companyView = "applicants";
+      render();
+    });
     const editBtn = el("button", "flex:1;padding:9px 0;background:#F0F0F0;border:none;border-radius:10px;color:#1B1B1B;font-size:12px;font-weight:600;cursor:pointer;");
     editBtn.textContent = "Edit";
     editBtn.addEventListener("click", () => {
@@ -823,6 +945,7 @@ function renderCompanyApp() {
     delBtn.addEventListener("click", () => {
       if (confirm(`Delete "${p.role}"? This can't be undone.`)) deleteCompanyPosting(p.id);
     });
+    actionsRow.appendChild(applicantsBtn);
     actionsRow.appendChild(editBtn);
     actionsRow.appendChild(delBtn);
 
@@ -840,10 +963,7 @@ function renderCompanyApp() {
 function renderPostingForm() {
   const wrap = el("div", "flex:1;overflow-y:auto;padding:0 24px 24px;display:flex;flex-direction:column;gap:16px;");
 
-  const backRow = el("button", "align-self:flex-start;background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:0;margin-bottom:-6px;");
-  backRow.textContent = "← Back to listings";
-  backRow.addEventListener("click", () => { state.companyView = "list"; render(); });
-  wrap.appendChild(backRow);
+  wrap.appendChild(backArrowButton(() => { state.companyView = "list"; render(); }));
 
   const roleField = el("div");
   roleField.appendChild(labelEl("Role Title"));
@@ -942,6 +1062,148 @@ function renderPostingForm() {
   return wrap;
 }
 
+// ===========================================================
+// Company: Applicants screen (per posting)
+// ===========================================================
+const APPLICANT_STATUS_STYLES = {
+  "Pending": { bg: "#FFF8E6", color: "#D98A00" },
+  "Under Review": { bg: "#EFF6FF", color: "#2563EB" },
+  "Rejected": { bg: "#FFF0F0", color: "#DC2626" },
+  "Approved by Coordinator": { bg: "#E8F7F2", color: "#1D9E75" },
+};
+
+function renderApplicantsScreen() {
+  const wrap = el("div", "flex:1;overflow-y:auto;padding:0 24px 24px;display:flex;flex-direction:column;gap:12px;");
+
+  const backRow = el("div", "padding-top:16px;margin-bottom:-4px;");
+  backRow.appendChild(backArrowButton(() => { state.companyView = "list"; render(); }));
+  wrap.appendChild(backRow);
+
+  const title = el("h2", "font-size:18px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.4px;");
+  title.textContent = `Applicants (${companyApplicants.length})`;
+  wrap.appendChild(title);
+
+  if (companyApplicants.length === 0) {
+    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
+    empty.textContent = "No one has applied to this posting yet.";
+    wrap.appendChild(empty);
+  }
+
+  companyApplicants.forEach((app) => {
+    const s = app.student || {};
+    const style = APPLICANT_STATUS_STYLES[app.status] || APPLICANT_STATUS_STYLES["Pending"];
+    const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+
+    const topRow = el("div", "display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:6px;");
+    const nameH3 = el("h3", "font-size:14px;font-weight:600;color:#1B1B1B;margin:0;letter-spacing:-0.2px;");
+    nameH3.textContent = s.name || "(no name set)";
+    const statusChip = el("span", `font-size:10px;font-weight:600;color:${style.color};background:${style.bg};padding:3px 8px;border-radius:20px;flex-shrink:0;white-space:nowrap;`);
+    statusChip.textContent = app.status;
+    topRow.appendChild(nameH3);
+    topRow.appendChild(statusChip);
+    card.appendChild(topRow);
+
+    const progP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 8px;");
+    progP.textContent = `${s.program || "No program set"} · ${s.year_level || "—"} Year`;
+    card.appendChild(progP);
+
+    if (s.skills && s.skills.length > 0) {
+      const skillsRow = el("div", "display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px;");
+      s.skills.forEach((sk) => {
+        const chip = el("span", "background:#F4F4F4;color:#1B1B1B;font-size:11px;padding:3px 9px;border-radius:20px;");
+        chip.textContent = sk;
+        skillsRow.appendChild(chip);
+      });
+      card.appendChild(skillsRow);
+    }
+
+    const actionsRow = el("div", "display:flex;gap:8px;");
+    const reviewBtn = el("button", "flex:1;padding:9px 0;background:#EFF6FF;border:none;border-radius:10px;color:#2563EB;font-size:12px;font-weight:600;cursor:pointer;");
+    reviewBtn.textContent = "Under Review";
+    reviewBtn.addEventListener("click", () => setApplicationStatus(app.id, "Under Review"));
+    const rejectBtn = el("button", "flex:1;padding:9px 0;background:#FFF0F0;border:none;border-radius:10px;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;");
+    rejectBtn.textContent = "Reject";
+    rejectBtn.addEventListener("click", () => setApplicationStatus(app.id, "Rejected"));
+    actionsRow.appendChild(reviewBtn);
+    actionsRow.appendChild(rejectBtn);
+    card.appendChild(actionsRow);
+
+    wrap.appendChild(card);
+  });
+
+  return wrap;
+}
+
+// ===========================================================
+// Coordinator Dashboard — read across all applications, give
+// final approval/rejection sign-off.
+// ===========================================================
+function renderCoordinatorApp() {
+  const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
+
+  const header = el("div", "display:flex;align-items:center;justify-content:space-between;padding:20px 24px 12px;flex-shrink:0;");
+  const headLeft = el("div");
+  const h1 = el("h1", "font-size:20px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.4px;");
+  h1.textContent = "Coordinator Dashboard";
+  const sub = el("p", "font-size:12px;color:#8A8A8A;margin:2px 0 0;");
+  sub.textContent = `${coordinatorApplications.length} total application${coordinatorApplications.length === 1 ? "" : "s"}`;
+  headLeft.appendChild(h1);
+  headLeft.appendChild(sub);
+  const signOutBtn = el("button", "background:none;border:none;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
+  signOutBtn.textContent = "Sign Out";
+  signOutBtn.addEventListener("click", signOut);
+  header.appendChild(headLeft);
+  header.appendChild(signOutBtn);
+  root.appendChild(header);
+
+  const content = el("div", "flex:1;overflow-y:auto;padding:0 24px 20px;display:flex;flex-direction:column;gap:12px;");
+
+  if (coordinatorApplications.length === 0) {
+    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
+    empty.textContent = "No applications have come in yet.";
+    content.appendChild(empty);
+  }
+
+  coordinatorApplications.forEach((app) => {
+    const s = app.student || {};
+    const p = app.posting || {};
+    const style = APPLICANT_STATUS_STYLES[app.status] || APPLICANT_STATUS_STYLES["Pending"];
+    const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+
+    const topRow = el("div", "display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px;");
+    const nameH3 = el("h3", "font-size:14px;font-weight:600;color:#1B1B1B;margin:0;letter-spacing:-0.2px;");
+    nameH3.textContent = s.name || "(no name set)";
+    const statusChip = el("span", `font-size:10px;font-weight:600;color:${style.color};background:${style.bg};padding:3px 8px;border-radius:20px;flex-shrink:0;white-space:nowrap;`);
+    statusChip.textContent = app.status;
+    topRow.appendChild(nameH3);
+    topRow.appendChild(statusChip);
+    card.appendChild(topRow);
+
+    const roleP = el("p", "font-size:12px;color:#1B1B1B;margin:0 0 2px;font-weight:500;");
+    roleP.textContent = `${p.role || ""} · ${p.company || ""}`;
+    const progP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 12px;");
+    progP.textContent = `${s.program || "No program set"} · ${s.year_level || "—"} Year`;
+    card.appendChild(roleP);
+    card.appendChild(progP);
+
+    const actionsRow = el("div", "display:flex;gap:8px;");
+    const approveBtn = el("button", "flex:1;padding:9px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;");
+    approveBtn.textContent = "Approve";
+    approveBtn.addEventListener("click", () => setApplicationStatus(app.id, "Approved by Coordinator"));
+    const rejectBtn = el("button", "flex:1;padding:9px 0;background:#FFF0F0;border:none;border-radius:10px;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;");
+    rejectBtn.textContent = "Reject";
+    rejectBtn.addEventListener("click", () => setApplicationStatus(app.id, "Rejected"));
+    actionsRow.appendChild(approveBtn);
+    actionsRow.appendChild(rejectBtn);
+    card.appendChild(actionsRow);
+
+    content.appendChild(card);
+  });
+
+  root.appendChild(content);
+  return root;
+}
+
 const SKILL_SUGGESTIONS = [
   "Web Development", "Python", "React", "SQL", "UI/UX Design",
   "Data Analysis", "Java", "Node.js", "Flutter", "Machine Learning",
@@ -961,9 +1223,8 @@ function renderOnboardingScreen() {
 
   const top = el("div", "padding:24px 24px 0;");
 
-  const backRow = el("button", "background:none;border:none;color:#8A8A8A;font-size:12px;cursor:pointer;padding:0;margin-bottom:16px;");
-  backRow.textContent = "← Back to Login";
-  backRow.addEventListener("click", signOut);
+  const backRow = el("div", "margin-bottom:16px;");
+  backRow.appendChild(backArrowButton(signOut));
   top.appendChild(backRow);
 
   const brand = el("div", "display:inline-flex;align-items:center;gap:6px;margin-bottom:24px;");
@@ -1410,16 +1671,16 @@ const STATUS_CONFIG = {
   "Pending": { bg: "#FFF8E6", color: "#D98A00" },
   "Under Review": { bg: "#EFF6FF", color: "#2563EB" },
   "Approved by Coordinator": { bg: "#E8F7F2", color: "#1D9E75" },
+  "Rejected": { bg: "#FFF0F0", color: "#DC2626" },
   "Saved": { bg: "#F4F4F4", color: "#8A8A8A" },
 };
 
 function renderMatchesScreen() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
 
-  const statusCycle = ["Pending", "Under Review", "Approved by Coordinator"];
-  const appliedPostings = POSTINGS.filter((p) => state.appliedIds.has(p.id)).map((p, i) => ({
+  const appliedPostings = POSTINGS.filter((p) => state.appliedIds.has(p.id)).map((p) => ({
     ...p,
-    status: statusCycle[i % 3],
+    status: state.applicationStatus[p.id] || "Pending",
   }));
   const savedPostings = POSTINGS.filter((p) => state.savedIds.has(p.id) && !state.appliedIds.has(p.id)).map((p) => ({
     ...p,
@@ -1671,67 +1932,46 @@ function renderProfileScreen() {
 // ===========================================================
 // Notifications Screen
 // ===========================================================
-const NOTIFICATIONS = [
-  {
-    id: "1",
-    type: "match",
-    title: "New High-Fit Match",
-    body: "Canva Philippines posted a Frontend Engineering Intern role — 72% match.",
-    time: "2 hours ago",
-    read: false,
-    icon: "✦",
-    iconBg: "#E8F7F2",
-    iconColor: "#1D9E75",
-  },
-  {
-    id: "2",
-    type: "status",
-    title: "Application Update",
-    body: "Your application to Accenture Philippines is now Under Review by your coordinator.",
-    time: "Yesterday",
-    read: false,
-    icon: "↗",
-    iconBg: "#EFF6FF",
-    iconColor: "#2563EB",
-  },
-  {
-    id: "3",
-    type: "reminder",
-    title: "Profile Incomplete",
-    body: "Add your year level to improve match accuracy and unlock more postings.",
-    time: "2 days ago",
-    read: true,
-    icon: "!",
-    iconBg: "#FFF8E6",
-    iconColor: "#D98A00",
-  },
-  {
-    id: "4",
-    type: "match",
-    title: "5 New Postings This Week",
-    body: "Based on your skills, 5 new internships were added this week. Check your Home feed.",
-    time: "3 days ago",
-    read: true,
-    icon: "✦",
-    iconBg: "#E8F7F2",
-    iconColor: "#1D9E75",
-  },
-  {
-    id: "5",
-    type: "status",
-    title: "Saved Posting Expiring",
-    body: "Globe Telecom's Data Analytics OJT closes in 3 days. Apply before it's gone.",
-    time: "4 days ago",
-    read: true,
-    icon: "⏱",
-    iconBg: "#FFF0F0",
-    iconColor: "#DC2626",
-  },
-];
+// ---------------------------------------------------------
+// Real notifications (fetched from the DB, generated by
+// triggers on application-status changes and new postings)
+// ---------------------------------------------------------
+let notifications = [];
+
+async function loadNotifications() {
+  if (!studentId) return;
+  const { data } = await sb
+    .from("notifications")
+    .select("*")
+    .eq("student_id", studentId)
+    .order("created_at", { ascending: false })
+    .limit(50);
+  notifications = data || [];
+}
+
+function timeAgo(isoString) {
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins} min${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return "Yesterday";
+  return `${days} days ago`;
+}
+
+async function markNotificationRead(id) {
+  const notif = notifications.find((n) => n.id === id);
+  if (!notif || notif.read) return;
+  notif.read = true; // optimistic
+  render();
+  await sb.from("notifications").update({ read: true }).eq("id", id);
+}
 
 function renderNotificationsScreen() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
-  const unread = NOTIFICATIONS.filter((n) => !n.read).length;
+  const unread = notifications.filter((n) => !n.read).length;
 
   const header = el("div", "padding:20px 24px 12px;flex-shrink:0;");
   const headRow = el("div", "display:flex;align-items:center;justify-content:space-between;");
@@ -1747,10 +1987,18 @@ function renderNotificationsScreen() {
   root.appendChild(header);
 
   const list = el("div", "flex:1;overflow-y:auto;padding:4px 24px 20px;display:flex;flex-direction:column;gap:8px;");
-  NOTIFICATIONS.forEach((notif) => {
-    const card = el("div", `background:${notif.read ? "#FFFFFF" : "#FAFFF9"};border-radius:14px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);display:flex;gap:12px;align-items:flex-start;border-left:${notif.read ? "none" : "3px solid #1D9E75"};`);
 
-    const iconBox = el("div", `width:36px;height:36px;border-radius:10px;background:${notif.iconBg};display:flex;align-items:center;justify-content:center;font-size:14px;color:${notif.iconColor};font-weight:700;flex-shrink:0;`);
+  if (notifications.length === 0) {
+    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
+    empty.textContent = "No notifications yet.";
+    list.appendChild(empty);
+  }
+
+  notifications.forEach((notif) => {
+    const card = el("div", `background:${notif.read ? "#FFFFFF" : "#FAFFF9"};border-radius:14px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);display:flex;gap:12px;align-items:flex-start;border-left:${notif.read ? "none" : "3px solid #1D9E75"};cursor:pointer;`);
+    card.addEventListener("click", () => markNotificationRead(notif.id));
+
+    const iconBox = el("div", `width:36px;height:36px;border-radius:10px;background:${notif.icon_bg};display:flex;align-items:center;justify-content:center;font-size:14px;color:${notif.icon_color};font-weight:700;flex-shrink:0;`);
     iconBox.textContent = notif.icon;
 
     const info = el("div", "flex:1;min-width:0;");
@@ -1765,7 +2013,7 @@ function renderNotificationsScreen() {
     const bodyP = el("p", "margin:0 0 6px;font-size:12px;color:#6A6A6A;line-height:1.5;");
     bodyP.textContent = notif.body;
     const timeSpan = el("span", "font-size:11px;color:#ABABAB;");
-    timeSpan.textContent = notif.time;
+    timeSpan.textContent = timeAgo(notif.created_at);
 
     info.appendChild(topRow);
     info.appendChild(bodyP);
@@ -1779,6 +2027,7 @@ function renderNotificationsScreen() {
 
   return root;
 }
+
 
 // ===========================================================
 // Career Quiz — fill-in-the-blank (no multiple choice). Answers
@@ -1991,8 +2240,11 @@ function renderBottomNav() {
     label.textContent = tab.label;
     btn.appendChild(iconWrap);
     btn.appendChild(label);
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       state.activeTab = tab.id;
+      if (tab.id === "notifications") {
+        await loadNotifications();
+      }
       render();
     });
     nav.appendChild(btn);
