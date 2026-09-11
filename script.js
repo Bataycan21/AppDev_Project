@@ -161,6 +161,7 @@ async function loadStudentData() {
     profileState.interests = s.interests || "";
     profileState.program = s.program || "";
     profileState.yearLevel = s.year_level || "";
+    profileState.resumeFilename = s.resume_filename || "";
     state.hasProfile = !!(s.program); // onboarding sets program, so its presence = profile completed
   }
 
@@ -186,6 +187,51 @@ async function persistProfile() {
     skills: profileState.skills,
     interests: profileState.interests,
   }).eq("id", studentId);
+}
+
+// ---------------------------------------------------------
+// Resume upload (student side) — stored in the private
+// "resumes" bucket under {studentId}/{filename}
+// ---------------------------------------------------------
+async function uploadResume(file) {
+  if (!studentId || !file) return;
+  if (file.type !== "application/pdf") {
+    alert("Please upload a PDF file.");
+    return;
+  }
+  profileState.resumeUploading = true;
+  render();
+
+  const path = `${studentId}/${file.name}`;
+  const { error: uploadError } = await sb.storage
+    .from("resumes")
+    .upload(path, file, { upsert: true, contentType: "application/pdf" });
+
+  if (uploadError) {
+    profileState.resumeUploading = false;
+    alert("Resume upload failed: " + uploadError.message);
+    render();
+    return;
+  }
+
+  await sb.from("students").update({
+    resume_path: path,
+    resume_filename: file.name,
+  }).eq("id", studentId);
+
+  profileState.resumeFilename = file.name;
+  profileState.resumeUploading = false;
+  render();
+}
+
+async function removeResume() {
+  if (!studentId) return;
+  const { data: studentRows } = await sb.from("students").select("resume_path").eq("id", studentId).limit(1);
+  const path = studentRows && studentRows[0] && studentRows[0].resume_path;
+  if (path) await sb.storage.from("resumes").remove([path]);
+  await sb.from("students").update({ resume_path: null, resume_filename: null }).eq("id", studentId);
+  profileState.resumeFilename = "";
+  render();
 }
 
 // ---------------------------------------------------------
@@ -284,15 +330,34 @@ async function loadApplicantsForPosting(postingId) {
   applicantsForPostingId = postingId;
   const { data } = await sb
     .from("applications")
-    .select("id, status, applied_at, students(id, name, program, year_level, skills, interests)")
+    .select("id, status, applied_at, resume_path, resume_filename, students(id, name, program, year_level, skills, interests, resume_path, resume_filename)")
     .eq("posting_id", postingId)
     .order("applied_at", { ascending: false });
-  companyApplicants = (data || []).map((row) => ({
-    id: row.id,
-    status: row.status,
-    appliedAt: row.applied_at,
-    student: row.students || {},
-  }));
+  companyApplicants = (data || []).map((row) => {
+    const s = row.students || {};
+    return {
+      id: row.id,
+      status: row.status,
+      appliedAt: row.applied_at,
+      // Prefer a resume uploaded specifically for this application; fall back to the profile resume.
+      student: {
+        ...s,
+        resume_path: row.resume_path || s.resume_path,
+        resume_filename: row.resume_filename || s.resume_filename,
+      },
+    };
+  });
+}
+
+// Opens a short-lived signed URL to an applicant's resume (private bucket).
+async function viewResume(resumePath) {
+  if (!resumePath) return;
+  const { data, error } = await sb.storage.from("resumes").createSignedUrl(resumePath, 60);
+  if (error || !data) {
+    alert("Could not open resume: " + (error ? error.message : "unknown error"));
+    return;
+  }
+  window.open(data.signedUrl, "_blank");
 }
 
 async function setApplicationStatus(applicationId, newStatus) {
@@ -310,15 +375,22 @@ let coordinatorApplications = []; // [{ id, status, appliedAt, student, posting 
 async function loadCoordinatorData() {
   const { data } = await sb
     .from("applications")
-    .select("id, status, applied_at, students(name, program, year_level, skills), postings(role, company, location)")
+    .select("id, status, applied_at, resume_path, resume_filename, students(name, program, year_level, skills, resume_path, resume_filename), postings(role, company, location)")
     .order("applied_at", { ascending: false });
-  coordinatorApplications = (data || []).map((row) => ({
-    id: row.id,
-    status: row.status,
-    appliedAt: row.applied_at,
-    student: row.students || {},
-    posting: row.postings || {},
-  }));
+  coordinatorApplications = (data || []).map((row) => {
+    const s = row.students || {};
+    return {
+      id: row.id,
+      status: row.status,
+      appliedAt: row.applied_at,
+      student: {
+        ...s,
+        resume_path: row.resume_path || s.resume_path,
+        resume_filename: row.resume_filename || s.resume_filename,
+      },
+      posting: row.postings || {},
+    };
+  });
 }
 
 // ---------------------------------------------------------
@@ -1117,6 +1189,17 @@ function renderApplicantsScreen() {
       card.appendChild(skillsRow);
     }
 
+    if (s.resume_path) {
+      const resumeRow = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;margin-bottom:12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
+      resumeRow.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span>View Resume${s.resume_filename ? " — " + s.resume_filename : ""}</span>`;
+      resumeRow.addEventListener("click", () => viewResume(s.resume_path));
+      card.appendChild(resumeRow);
+    } else {
+      const noResume = el("p", "font-size:11px;color:#ABABAB;margin:0 0 12px;");
+      noResume.textContent = "No resume uploaded.";
+      card.appendChild(noResume);
+    }
+
     const actionsRow = el("div", "display:flex;gap:8px;");
     const reviewBtn = el("button", "flex:1;padding:9px 0;background:#EFF6FF;border:none;border-radius:10px;color:#2563EB;font-size:12px;font-weight:600;cursor:pointer;");
     reviewBtn.textContent = "Under Review";
@@ -1185,6 +1268,13 @@ function renderCoordinatorApp() {
     progP.textContent = `${s.program || "No program set"} · ${s.year_level || "—"} Year`;
     card.appendChild(roleP);
     card.appendChild(progP);
+
+    if (s.resume_path) {
+      const resumeRow = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;margin-bottom:12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
+      resumeRow.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span>View Resume${s.resume_filename ? " — " + s.resume_filename : ""}</span>`;
+      resumeRow.addEventListener("click", () => viewResume(s.resume_path));
+      card.appendChild(resumeRow);
+    }
 
     const actionsRow = el("div", "display:flex;gap:8px;");
     const approveBtn = el("button", "flex:1;padding:9px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;");
@@ -1477,6 +1567,7 @@ function renderPostingCard(posting, rank) {
   const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04);cursor:pointer;position:relative;");
   card.addEventListener("click", () => {
     state.selectedPostingId = posting.id;
+    resetApplyForm();
     render();
   });
 
@@ -1548,13 +1639,51 @@ function toggleSave(id) {
   }
 }
 
-function applyToPosting(id) {
-  state.appliedIds.add(id);
+// ---------------------------------------------------------
+// Apply flow — lets the student choose their profile resume
+// or upload one specifically for this application.
+// ---------------------------------------------------------
+const applyFormState = { useProfileResume: true, file: null, uploading: false };
+
+function resetApplyForm() {
+  applyFormState.useProfileResume = !!profileState.resumeFilename;
+  applyFormState.file = null;
+  applyFormState.uploading = false;
+}
+
+async function submitApplication(postingId) {
+  let resumePath = null;
+  let resumeFilename = null;
+
+  if (!applyFormState.useProfileResume && applyFormState.file) {
+    applyFormState.uploading = true;
+    render();
+    const path = `${studentId}/applications/${postingId}-${applyFormState.file.name}`;
+    const { error } = await sb.storage
+      .from("resumes")
+      .upload(path, applyFormState.file, { upsert: true, contentType: "application/pdf" });
+    if (error) {
+      applyFormState.uploading = false;
+      alert("Resume upload failed: " + error.message);
+      render();
+      return;
+    }
+    resumePath = path;
+    resumeFilename = applyFormState.file.name;
+  }
+
+  state.appliedIds.add(postingId);
   state.selectedPostingId = null;
+  applyFormState.uploading = false;
   render();
 
   if (!studentId) return;
-  sb.from("applications").upsert({ student_id: studentId, posting_id: id }, { onConflict: "student_id,posting_id" });
+  const payload = { student_id: studentId, posting_id: postingId };
+  if (resumePath) {
+    payload.resume_path = resumePath;
+    payload.resume_filename = resumeFilename;
+  }
+  await sb.from("applications").upsert(payload, { onConflict: "student_id,posting_id" });
 }
 
 // ===========================================================
@@ -1648,15 +1777,72 @@ function renderPostingDetailScreen(posting) {
   card3.appendChild(descP);
   content.appendChild(card3);
 
+  // Resume for this application (only relevant before applying)
+  if (!applied) {
+    const resumeCard = el("div", "background:#FFFFFF;border-radius:16px;padding:18px 20px;margin-top:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+    const h3c = el("h3", "margin:0 0 10px;font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;");
+    h3c.textContent = "Resume for This Application";
+    resumeCard.appendChild(h3c);
+
+    if (profileState.resumeFilename) {
+      const optA = el("label", "display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:10px;background:#F9F9F9;margin-bottom:8px;cursor:pointer;");
+      const radioA = el("input", "", { type: "radio", name: "resumeChoice", checked: applyFormState.useProfileResume });
+      radioA.addEventListener("change", () => { applyFormState.useProfileResume = true; render(); });
+      const labelA = el("span", "font-size:13px;color:#1B1B1B;");
+      labelA.textContent = `Use my profile resume (${profileState.resumeFilename})`;
+      optA.appendChild(radioA);
+      optA.appendChild(labelA);
+      resumeCard.appendChild(optA);
+
+      const optB = el("label", "display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:10px;background:#F9F9F9;cursor:pointer;");
+      const radioB = el("input", "", { type: "radio", name: "resumeChoice", checked: !applyFormState.useProfileResume });
+      radioB.addEventListener("change", () => { applyFormState.useProfileResume = false; render(); });
+      const labelB = el("span", "font-size:13px;color:#1B1B1B;");
+      labelB.textContent = "Upload a different resume for this role";
+      optB.appendChild(radioB);
+      optB.appendChild(labelB);
+      resumeCard.appendChild(optB);
+    }
+
+    if (!profileState.resumeFilename || !applyFormState.useProfileResume) {
+      const uploadWrap = el("div", "margin-top:10px;");
+      if (applyFormState.file) {
+        const fileRow = el("div", "display:flex;align-items:center;gap:8px;background:#E8F7F2;border-radius:10px;padding:10px 12px;");
+        fileRow.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+        const fname = el("span", "font-size:13px;color:#1B1B1B;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+        fname.textContent = applyFormState.file.name;
+        fileRow.appendChild(fname);
+        uploadWrap.appendChild(fileRow);
+      } else {
+        const uploadLabel = el("label", "display:flex;flex-direction:column;align-items:center;gap:6px;padding:18px;border:1.5px dashed #D9D9D9;border-radius:10px;cursor:pointer;color:#8A8A8A;");
+        uploadLabel.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#8A8A8A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><span style="font-size:12px;">Tap to upload a resume (PDF)</span>`;
+        const fileInput = el("input", "display:none;", { type: "file", accept: "application/pdf" });
+        fileInput.addEventListener("change", (e) => {
+          if (e.target.files[0]) { applyFormState.file = e.target.files[0]; render(); }
+        });
+        uploadLabel.appendChild(fileInput);
+        uploadWrap.appendChild(uploadLabel);
+      }
+      resumeCard.appendChild(uploadWrap);
+    }
+
+    content.appendChild(resumeCard);
+  }
+
   root.appendChild(content);
 
   // Apply CTA
   const ctaWrap = el("div", "padding:12px 24px 20px;background:#FAFAFA;border-top:1px solid #EFEFEF;flex-shrink:0;");
-  const applyBtn = el("button", `width:100%;padding:15px;background:${applied ? "#E8F7F2" : "#1D9E75"};border:none;border-radius:14px;color:${applied ? "#1D9E75" : "#FFFFFF"};font-size:15px;font-weight:600;cursor:${applied ? "default" : "pointer"};letter-spacing:-0.2px;transition:background 0.2s ease;`);
-  applyBtn.textContent = applied ? "Application Submitted" : "Apply Now";
-  applyBtn.disabled = applied;
+  const canApply = applied || applyFormState.useProfileResume || !!applyFormState.file;
+  const applyBtn = el("button", `width:100%;padding:15px;background:${applied ? "#E8F7F2" : "#1D9E75"};border:none;border-radius:14px;color:${applied ? "#1D9E75" : "#FFFFFF"};font-size:15px;font-weight:600;cursor:${applied || !canApply ? "default" : "pointer"};letter-spacing:-0.2px;transition:background 0.2s ease;opacity:${!applied && !canApply ? 0.5 : 1};`);
+  applyBtn.textContent = applied
+    ? "Application Submitted"
+    : applyFormState.uploading
+      ? "Uploading Resume\u2026"
+      : "Apply Now";
+  applyBtn.disabled = applied || !canApply || applyFormState.uploading;
   applyBtn.addEventListener("click", () => {
-    if (!applied) applyToPosting(posting.id);
+    if (!applied && canApply) submitApplication(posting.id);
   });
   ctaWrap.appendChild(applyBtn);
   root.appendChild(ctaWrap);
@@ -1717,6 +1903,7 @@ function renderMatchesScreen() {
       const row = el("div", "background:#FFFFFF;border-radius:14px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);cursor:pointer;display:flex;align-items:center;gap:12px;");
       row.addEventListener("click", () => {
         state.selectedPostingId = match.id;
+        resetApplyForm();
         render();
       });
 
@@ -1767,6 +1954,8 @@ const profileState = {
   program: "",
   yearLevel: "",
   saved: false,
+  resumeFilename: "",
+  resumeUploading: false,
 };
 
 function renderProfileScreen() {
@@ -1903,6 +2092,46 @@ function renderProfileScreen() {
   interestsCard.appendChild(interestsLabel);
   interestsCard.appendChild(interestsTextarea);
   content.appendChild(interestsCard);
+
+  // Resume upload
+  const resumeCard = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
+  const resumeLabel = el("label", "display:block;font-size:11px;font-weight:600;color:#8A8A8A;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:10px;");
+  resumeLabel.textContent = "Resume (PDF)";
+  resumeCard.appendChild(resumeLabel);
+
+  if (profileState.resumeUploading) {
+    const uploadingP = el("p", "font-size:13px;color:#8A8A8A;margin:0;");
+    uploadingP.textContent = "Uploading\u2026";
+    resumeCard.appendChild(uploadingP);
+  } else if (profileState.resumeFilename) {
+    const fileRow = el("div", "display:flex;align-items:center;justify-content:space-between;background:#F9F9F9;border-radius:10px;padding:10px 12px;border:1.5px solid #EFEFEF;");
+    const fileInfo = el("div", "display:flex;align-items:center;gap:8px;min-width:0;");
+    fileInfo.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+    const fileName = el("span", "font-size:13px;color:#1B1B1B;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+    fileName.textContent = profileState.resumeFilename;
+    fileInfo.appendChild(fileName);
+    const removeBtn = el("button", "background:none;border:none;cursor:pointer;color:#DC2626;font-size:12px;font-weight:600;flex-shrink:0;");
+    removeBtn.textContent = "Remove";
+    removeBtn.addEventListener("click", removeResume);
+    fileRow.appendChild(fileInfo);
+    fileRow.appendChild(removeBtn);
+    resumeCard.appendChild(fileRow);
+
+    const replaceLabel = el("label", "display:inline-block;margin-top:10px;font-size:12px;color:#1D9E75;font-weight:600;cursor:pointer;");
+    replaceLabel.textContent = "Replace resume";
+    const replaceInput = el("input", "display:none;", { type: "file", accept: "application/pdf" });
+    replaceInput.addEventListener("change", (e) => { if (e.target.files[0]) uploadResume(e.target.files[0]); });
+    replaceLabel.appendChild(replaceInput);
+    resumeCard.appendChild(replaceLabel);
+  } else {
+    const uploadLabel = el("label", "display:flex;flex-direction:column;align-items:center;gap:6px;padding:20px;border:1.5px dashed #D9D9D9;border-radius:10px;cursor:pointer;color:#8A8A8A;");
+    uploadLabel.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#8A8A8A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><span style="font-size:12px;">Tap to upload your resume (PDF)</span>`;
+    const uploadInput = el("input", "display:none;", { type: "file", accept: "application/pdf" });
+    uploadInput.addEventListener("change", (e) => { if (e.target.files[0]) uploadResume(e.target.files[0]); });
+    uploadLabel.appendChild(uploadInput);
+    resumeCard.appendChild(uploadLabel);
+  }
+  content.appendChild(resumeCard);
 
   // Save button
   const saveBtn = el("button", `width:100%;padding:14px;background:${profileState.saved ? "#E8F7F2" : "#1D9E75"};border:none;border-radius:14px;color:${profileState.saved ? "#1D9E75" : "#FFFFFF"};font-size:15px;font-weight:600;cursor:pointer;letter-spacing:-0.2px;transition:background 0.2s ease, color 0.2s ease;`);
