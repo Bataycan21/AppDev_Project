@@ -157,6 +157,7 @@ async function loadStudentData() {
   const { data: studentRows } = await sb.from("students").select("*").eq("id", studentId).limit(1);
   const s = studentRows && studentRows[0];
   if (s) {
+    profileState.name = s.name || "";
     profileState.skills = s.skills || [];
     profileState.interests = s.interests || "";
     profileState.program = s.program || "";
@@ -182,6 +183,7 @@ async function loadStudentData() {
 async function persistProfile() {
   if (!studentId) return;
   await sb.from("students").update({
+    name: profileState.name,
     program: profileState.program,
     year_level: profileState.yearLevel,
     skills: profileState.skills,
@@ -1301,6 +1303,7 @@ const SKILL_SUGGESTIONS = [
 ];
 
 const onboardingState = {
+  name: "",
   program: "",
   yearLevel: "",
   skills: ["Web Development", "Python"],
@@ -1336,6 +1339,17 @@ function renderOnboardingScreen() {
   root.appendChild(top);
 
   const form = el("div", "padding:0 24px;display:flex;flex-direction:column;gap:20px;");
+
+  // Full name field
+  const nameField = el("div");
+  const nameLabel = labelEl("Full Name");
+  const nameInput = el("input", inputStyleText());
+  nameInput.placeholder = "e.g. Marco Reyes";
+  nameInput.value = onboardingState.name;
+  nameInput.addEventListener("input", (e) => { onboardingState.name = e.target.value; });
+  nameField.appendChild(nameLabel);
+  nameField.appendChild(nameInput);
+  form.appendChild(nameField);
 
   // Program field
   const programField = el("div");
@@ -1463,6 +1477,7 @@ function renderOnboardingScreen() {
   saveBtn.textContent = "Save Profile";
   saveBtn.addEventListener("click", () => {
     state.hasProfile = true;
+    profileState.name = onboardingState.name || profileState.name;
     profileState.skills = [...onboardingState.skills];
     profileState.interests = onboardingState.interests || profileState.interests;
     profileState.program = onboardingState.program || profileState.program;
@@ -1948,6 +1963,7 @@ const ALL_SKILLS = [
 ];
 
 const profileState = {
+  name: "",
   skills: [],
   skillInput: "",
   interests: "",
@@ -1965,10 +1981,11 @@ function renderProfileScreen() {
   const header = el("div", "padding:20px 24px 16px;flex-shrink:0;");
   const headRow = el("div", "display:flex;align-items:center;gap:14px;margin-bottom:20px;");
   const avatar = el("div", "width:52px;height:52px;border-radius:16px;background:#1D9E75;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#FFFFFF;");
-  avatar.textContent = (state.session && state.session.email ? state.session.email.charAt(0) : "S").toUpperCase();
+  const avatarSource = profileState.name || (state.session && state.session.email) || "S";
+  avatar.textContent = avatarSource.charAt(0).toUpperCase();
   const nameBlock = el("div");
   const nameH2 = el("h2", "margin:0;font-size:18px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;");
-  nameH2.textContent = state.session && state.session.email ? state.session.email : "My Profile";
+  nameH2.textContent = profileState.name || (state.session && state.session.email) || "My Profile";
   const progP = el("p", "margin:0;font-size:12px;color:#8A8A8A;");
   progP.textContent = `${profileState.program || "No program set"} · ${profileState.yearLevel || "—"} Year`;
   nameBlock.appendChild(nameH2);
@@ -1999,6 +2016,21 @@ function renderProfileScreen() {
     statsRow.appendChild(box);
   });
   content.appendChild(statsRow);
+
+  // Full name (editable — fills in "(no name set)" gap on the company side)
+  const nameCard = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
+  const nameFieldLabel = el("label", "display:block;font-size:11px;font-weight:600;color:#8A8A8A;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:10px;");
+  nameFieldLabel.textContent = "Full Name";
+  const nameFieldInput = el("input", "width:100%;border:1.5px solid #EFEFEF;border-radius:10px;padding:10px 12px;font-size:13px;color:#1B1B1B;outline:none;background:#FAFAFA;box-sizing:border-box;");
+  nameFieldInput.placeholder = "e.g. Marco Reyes";
+  nameFieldInput.value = profileState.name;
+  nameFieldInput.addEventListener("input", (e) => {
+    profileState.name = e.target.value;
+    profileState.saved = false;
+  });
+  nameCard.appendChild(nameFieldLabel);
+  nameCard.appendChild(nameFieldInput);
+  content.appendChild(nameCard);
 
   // Skills section
   const skillsCard = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
@@ -2259,12 +2291,13 @@ function renderNotificationsScreen() {
 
 
 // ===========================================================
-// Career Quiz — fill-in-the-blank (no multiple choice). Answers
-// are combined and matched against domain keyword groups, then
-// folded into the student's profile so real posting matches
-// (via the TF-IDF engine) reflect it too.
+// Career Quiz — fill-in-the-blank (no multiple choice). Questions
+// and the final analysis are AI-generated (via the "career-ai"
+// Supabase Edge Function, which proxies to Grok) when available,
+// falling back to the static questions + keyword-group scoring
+// if the AI call fails or isn't deployed yet.
 // ===========================================================
-const QUIZ_QUESTIONS = [
+const STATIC_QUIZ_QUESTIONS = [
   { q: "What kind of work do you want to do after graduating?", placeholder: "e.g. I want to focus on the IT department, fixing systems and helping people troubleshoot problems." },
   { q: "What skills or tools do you enjoy using the most?", placeholder: "e.g. debugging code, working with servers and databases, SQL, Figma..." },
   { q: "Describe a task or project you'd love to work on.", placeholder: "e.g. Building a dashboard that analyzes sales data with machine learning." },
@@ -2277,19 +2310,61 @@ const FIELD_INFO = {
   Business: { label: "Business Operations", office: "Business/Ops or PM office", desc: "Your answers lean toward organizing people and process. Look at ops, PM, or coordinator roles." },
 };
 
-const quizState = { index: 0, answers: [], done: false, resultField: null };
+const quizState = {
+  index: 0,
+  answers: [],
+  done: false,
+  resultField: null,   // fallback (keyword-group) result
+  aiAnalysis: null,    // { recommended_path, confidence, reasoning, alternative_paths, skills_to_develop }
+  questions: STATIC_QUIZ_QUESTIONS,
+  loadingQuestions: false,
+  analyzing: false,
+};
 
-function startQuiz() {
+// Calls the career-ai edge function. Returns null on any failure so
+// callers can fall back to the static/keyword-based behavior.
+async function callCareerAI(action, extra) {
+  try {
+    const { data, error } = await sb.functions.invoke("career-ai", {
+      body: {
+        action,
+        profile: {
+          program: profileState.program,
+          yearLevel: profileState.yearLevel,
+          skills: profileState.skills,
+          interests: profileState.interests,
+        },
+        ...extra,
+      },
+    });
+    if (error) return null;
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function startQuiz() {
   quizState.index = 0;
-  quizState.answers = QUIZ_QUESTIONS.map(() => "");
   quizState.done = false;
   quizState.resultField = null;
+  quizState.aiAnalysis = null;
+  quizState.questions = STATIC_QUIZ_QUESTIONS;
+  quizState.loadingQuestions = true;
   state.showQuiz = true;
+  render();
+
+  const ai = await callCareerAI("generate_questions");
+  if (ai && Array.isArray(ai.questions) && ai.questions.length > 0) {
+    quizState.questions = ai.questions;
+  }
+  quizState.answers = quizState.questions.map(() => "");
+  quizState.loadingQuestions = false;
   render();
 }
 
-// Scores the combined free-text answers against each domain keyword
-// group (with synonym expansion) and picks the strongest match.
+// Fallback: scores the combined free-text answers against each domain
+// keyword group (with synonym expansion) and picks the strongest match.
 function scoreQuizAnswers(combinedText) {
   const expanded = expandWithSynonyms(tokenize(combinedText));
   const counts = {};
@@ -2300,16 +2375,25 @@ function scoreQuizAnswers(combinedText) {
   return sorted[0][1] > 0 ? sorted[0][0] : "Engineering"; // sensible default if nothing matched
 }
 
-function submitQuizAnswer(text) {
+async function submitQuizAnswer(text) {
   quizState.answers[quizState.index] = text;
-  if (quizState.index < QUIZ_QUESTIONS.length - 1) {
+  if (quizState.index < quizState.questions.length - 1) {
     quizState.index += 1;
     render();
     return;
   }
-  quizState.done = true;
+
+  quizState.analyzing = true;
+  render();
+
   const combined = quizState.answers.join(" ");
-  quizState.resultField = scoreQuizAnswers(combined);
+
+  const ai = await callCareerAI("analyze", { answers: quizState.answers });
+  if (ai && ai.analysis && ai.analysis.recommended_path) {
+    quizState.aiAnalysis = ai.analysis;
+  } else {
+    quizState.resultField = scoreQuizAnswers(combined); // fallback
+  }
 
   // Fold the quiz answers into the student's profile so the main
   // TF-IDF matching engine (postings feed, fit %) reflects it too.
@@ -2317,6 +2401,9 @@ function submitQuizAnswer(text) {
   profileState.interests = existing ? `${existing} ${combined}` : combined;
   recomputeMatches();
   persistProfile();
+
+  quizState.done = true;
+  quizState.analyzing = false;
   render();
 }
 
@@ -2343,55 +2430,100 @@ function renderQuizScreen() {
 
   const content = el("div", "flex:1;overflow-y:auto;padding:0 24px 24px;");
 
-  if (!quizState.done) {
-    const q = QUIZ_QUESTIONS[quizState.index];
+  if (quizState.loadingQuestions) {
+    const loadingP = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:80px;");
+    loadingP.textContent = "Preparing your questions\u2026";
+    content.appendChild(loadingP);
+  } else if (!quizState.done) {
+    const q = quizState.questions[quizState.index];
 
     const barTrack = el("div", "width:100%;height:6px;background:#EFEFEF;border-radius:3px;margin-bottom:10px;overflow:hidden;");
-    const barFill = el("div", `height:100%;background:#1D9E75;border-radius:3px;width:${((quizState.index) / QUIZ_QUESTIONS.length) * 100}%;transition:width 0.2s ease;`);
+    const barFill = el("div", `height:100%;background:#1D9E75;border-radius:3px;width:${((quizState.index) / quizState.questions.length) * 100}%;transition:width 0.2s ease;`);
     barTrack.appendChild(barFill);
     content.appendChild(barTrack);
 
     const progress = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 8px;");
-    progress.textContent = `Question ${quizState.index + 1} of ${QUIZ_QUESTIONS.length}`;
+    progress.textContent = `Question ${quizState.index + 1} of ${quizState.questions.length}`;
     const qTitle = el("h2", "font-size:19px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;margin:0 0 16px;");
     qTitle.textContent = q.q;
     content.appendChild(progress);
     content.appendChild(qTitle);
 
     const textarea = el("textarea", inputStyleText() + "resize:none;line-height:1.5;min-height:120px;");
-    textarea.placeholder = q.placeholder;
+    textarea.placeholder = q.placeholder || "";
     textarea.value = quizState.answers[quizState.index] || "";
     textarea.id = "quiz-answer-input";
+    textarea.disabled = quizState.analyzing;
     textarea.addEventListener("input", (e) => { quizState.answers[quizState.index] = e.target.value; });
     content.appendChild(textarea);
 
     const nextBtn = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;");
-    nextBtn.textContent = quizState.index < QUIZ_QUESTIONS.length - 1 ? "Next" : "See My Result";
+    const isLast = quizState.index === quizState.questions.length - 1;
+    nextBtn.textContent = quizState.analyzing ? "Analyzing\u2026" : (isLast ? "See My Result" : "Next");
+    nextBtn.disabled = quizState.analyzing;
     nextBtn.addEventListener("click", () => {
       const val = document.getElementById("quiz-answer-input").value;
       submitQuizAnswer(val);
     });
     content.appendChild(nextBtn);
   } else {
-    const top = quizState.resultField;
-    const info = FIELD_INFO[top];
-
     const badge = el("div", "width:56px;height:56px;border-radius:16px;background:#E8F7F2;display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:16px;");
-    badge.textContent = "✦";
-    const resultLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 6px;");
-    resultLabel.textContent = "Your best fit";
-    const resultTitle = el("h2", "font-size:22px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 10px;");
-    resultTitle.textContent = info.label;
-    const officeP = el("p", "font-size:13px;color:#1D9E75;font-weight:600;margin:0 0 12px;");
-    officeP.textContent = `Go to: ${info.office}`;
-    const descP = el("p", "font-size:14px;color:#3A3A3A;line-height:1.6;margin:0 0 24px;");
-    descP.textContent = info.desc;
-
+    badge.textContent = "\u2726";
     content.appendChild(badge);
-    content.appendChild(resultLabel);
-    content.appendChild(resultTitle);
-    content.appendChild(officeP);
-    content.appendChild(descP);
+
+    if (quizState.aiAnalysis) {
+      const a = quizState.aiAnalysis;
+      const resultLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 6px;");
+      resultLabel.textContent = `Your best fit \u00b7 ${(a.confidence || "medium").toUpperCase()} confidence`;
+      const resultTitle = el("h2", "font-size:22px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 10px;");
+      resultTitle.textContent = a.recommended_path;
+      const descP = el("p", "font-size:14px;color:#3A3A3A;line-height:1.6;margin:0 0 16px;");
+      descP.textContent = a.reasoning || "";
+      content.appendChild(resultLabel);
+      content.appendChild(resultTitle);
+      content.appendChild(descP);
+
+      if (Array.isArray(a.alternative_paths) && a.alternative_paths.length > 0) {
+        const altLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 8px;");
+        altLabel.textContent = "Also worth considering";
+        const altRow = el("div", "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;");
+        a.alternative_paths.forEach((alt) => {
+          const chip = el("span", "background:#F4F4F4;color:#1B1B1B;font-size:12px;padding:5px 12px;border-radius:20px;");
+          chip.textContent = alt;
+          altRow.appendChild(chip);
+        });
+        content.appendChild(altLabel);
+        content.appendChild(altRow);
+      }
+
+      if (Array.isArray(a.skills_to_develop) && a.skills_to_develop.length > 0) {
+        const skillLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 8px;");
+        skillLabel.textContent = "Skills to develop";
+        const skillRow = el("div", "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:20px;");
+        a.skills_to_develop.forEach((sk) => {
+          const chip = el("span", "background:#E8F7F2;color:#1D9E75;font-size:12px;font-weight:500;padding:5px 12px;border-radius:20px;");
+          chip.textContent = sk;
+          skillRow.appendChild(chip);
+        });
+        content.appendChild(skillLabel);
+        content.appendChild(skillRow);
+      }
+    } else {
+      const top = quizState.resultField;
+      const info = FIELD_INFO[top];
+      const resultLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 6px;");
+      resultLabel.textContent = "Your best fit";
+      const resultTitle = el("h2", "font-size:22px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 10px;");
+      resultTitle.textContent = info.label;
+      const officeP = el("p", "font-size:13px;color:#1D9E75;font-weight:600;margin:0 0 12px;");
+      officeP.textContent = `Go to: ${info.office}`;
+      const descP = el("p", "font-size:14px;color:#3A3A3A;line-height:1.6;margin:0 0 24px;");
+      descP.textContent = info.desc;
+      content.appendChild(resultLabel);
+      content.appendChild(resultTitle);
+      content.appendChild(officeP);
+      content.appendChild(descP);
+    }
 
     // Top real postings by the (now quiz-updated) fit score
     const matches = [...POSTINGS].sort((a, b) => getFitScore(b.id) - getFitScore(a.id)).slice(0, 3);
