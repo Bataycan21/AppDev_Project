@@ -22,6 +22,7 @@ function mapPostingRow(row) {
     description: row.description,
     tags: row.tags || [],
     logo: row.logo,
+    salary: row.salary || "",
     companyId: row.company_id,
     companyIndustry: c.industry || "",
     companySpecialization: c.specialization || "",
@@ -274,7 +275,7 @@ async function persistCompanyProfile() {
   state.hasCompanyProfile = true;
 }
 
-const postingFormState = { id: null, role: "", location: "", summary: "", description: "", tags: [], tagInput: "" };
+const postingFormState = { id: null, role: "", location: "", summary: "", description: "", tags: [], tagInput: "", salary: "" };
 
 function resetPostingForm(existing) {
   if (existing) {
@@ -284,6 +285,7 @@ function resetPostingForm(existing) {
     postingFormState.summary = existing.summary || "";
     postingFormState.description = existing.description || "";
     postingFormState.tags = [...existing.tags];
+    postingFormState.salary = existing.salary || "";
   } else {
     postingFormState.id = null;
     postingFormState.role = "";
@@ -291,6 +293,7 @@ function resetPostingForm(existing) {
     postingFormState.summary = "";
     postingFormState.description = "";
     postingFormState.tags = [];
+    postingFormState.salary = "";
   }
   postingFormState.tagInput = "";
 }
@@ -305,6 +308,7 @@ async function savePostingForm() {
     tags: postingFormState.tags,
     logo: companyName.trim().charAt(0).toUpperCase() || "?",
     company_id: companyId,
+    salary: postingFormState.salary,
   };
   if (postingFormState.id) {
     await sb.from("postings").update(payload).eq("id", postingFormState.id);
@@ -990,7 +994,7 @@ function renderCompanyApp() {
     const roleH3 = el("h3", "font-size:15px;font-weight:600;color:#1B1B1B;margin:0 0 4px;letter-spacing:-0.2px;");
     roleH3.textContent = p.role;
     const locP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 12px;");
-    locP.textContent = p.location;
+    locP.textContent = p.salary ? `${p.location} \u00b7 ${p.salary}` : p.location;
 
     const tagsRow = el("div", "display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px;");
     p.tags.forEach((t) => {
@@ -1056,6 +1060,15 @@ function renderPostingForm() {
   locInput.addEventListener("input", (e) => { postingFormState.location = e.target.value; });
   locField.appendChild(locInput);
   wrap.appendChild(locField);
+
+  const salaryField = el("div");
+  salaryField.appendChild(labelEl("Salary / Allowance (optional)"));
+  const salaryInput = el("input", inputStyleText());
+  salaryInput.placeholder = "e.g. \u20b18,000/month, or Unpaid, or \u20b1500/day";
+  salaryInput.value = postingFormState.salary;
+  salaryInput.addEventListener("input", (e) => { postingFormState.salary = e.target.value; });
+  salaryField.appendChild(salaryInput);
+  wrap.appendChild(salaryField);
 
   const sumField = el("div");
   sumField.appendChild(labelEl("Short Summary"));
@@ -1631,6 +1644,11 @@ function renderPostingCard(posting, rank) {
   info.appendChild(topRow);
   info.appendChild(roleTitle);
   info.appendChild(summary);
+  if (posting.salary) {
+    const salaryChip = el("p", "font-size:12px;color:#1D9E75;font-weight:600;margin:0 0 10px;");
+    salaryChip.textContent = posting.salary;
+    info.appendChild(salaryChip);
+  }
   info.appendChild(bottomRow);
 
   row.appendChild(logo);
@@ -1764,6 +1782,11 @@ function renderPostingDetailScreen(posting) {
   locBadge.textContent = posting.location;
   row2.appendChild(fitBadge);
   row2.appendChild(locBadge);
+  if (posting.salary) {
+    const salaryBadge = el("span", "font-size:11px;color:#1D9E75;font-weight:600;background:#E8F7F2;padding:5px 10px;border-radius:20px;");
+    salaryBadge.textContent = posting.salary;
+    row2.appendChild(salaryBadge);
+  }
   card1.appendChild(row2);
 
   content.appendChild(card1);
@@ -2291,38 +2314,84 @@ function renderNotificationsScreen() {
 
 
 // ===========================================================
-// Career Quiz — fill-in-the-blank (no multiple choice). Questions
-// and the final analysis are AI-generated (via the "career-ai"
-// Supabase Edge Function, which proxies to Grok) when available,
-// falling back to the static questions + keyword-group scoring
-// if the AI call fails or isn't deployed yet.
+// Career Quiz — MBTI-style forced-choice ("would you rather")
+// pairing every combination of the 4 work styles (Engineering,
+// Data, Design, Business), so each style appears in exactly 3
+// of the 6 questions — a clean round-robin tally instead of a
+// single 4-option pick. The final analysis is AI-generated (via
+// the "career-ai" Supabase Edge Function, proxying to Groq) when
+// available, falling back to the raw tally + FIELD_INFO if the
+// AI call fails or isn't deployed yet.
 // ===========================================================
 const STATIC_QUIZ_QUESTIONS = [
-  { q: "What kind of work do you want to do after graduating?", placeholder: "e.g. I want to focus on the IT department, fixing systems and helping people troubleshoot problems." },
-  { q: "What skills or tools do you enjoy using the most?", placeholder: "e.g. debugging code, working with servers and databases, SQL, Figma..." },
-  { q: "Describe a task or project you'd love to work on.", placeholder: "e.g. Building a dashboard that analyzes sales data with machine learning." },
+  { q: "Would you rather...", options: [
+    { text: "Build the system that processes information", field: "Engineering" },
+    { text: "Uncover the patterns hidden inside it", field: "Data" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Make something work perfectly under the hood", field: "Engineering" },
+    { text: "Make something look and feel intuitive to use", field: "Design" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Write the code that automates a process", field: "Engineering" },
+    { text: "Manage the people and plan behind that process", field: "Business" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Explain a trend using numbers", field: "Data" },
+    { text: "Explain it using a visual you designed", field: "Design" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Dig into a spreadsheet to find the answer", field: "Data" },
+    { text: "Coordinate the team that acts on the answer", field: "Business" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Craft how something looks and feels", field: "Design" },
+    { text: "Organize how a project gets delivered", field: "Business" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Fix a bug in the codebase", field: "Engineering" },
+    { text: "Find the reason a metric suddenly dropped", field: "Data" },
+  ] },
+  { q: "Would you rather...", options: [
+    { text: "Perfect the visual details of a screen", field: "Design" },
+    { text: "Plan out the milestones for shipping it", field: "Business" },
+  ] },
 ];
 
 const FIELD_INFO = {
-  Engineering: { label: "Software Engineering / IT", office: "Engineering / IT Support office", desc: "Your answers lean toward building, fixing, and supporting technical systems. Look at software, mobile, or IT/helpdesk roles." },
-  Data: { label: "Data & Analytics", office: "Data / Analytics office", desc: "Your answers lean toward numbers and patterns. Look at data analyst, BI, or ML-adjacent roles." },
-  Design: { label: "UI/UX Design", office: "Design / Product team", desc: "Your answers lean toward how things look and feel. Look at product or UI/UX design roles." },
-  Business: { label: "Business Operations", office: "Business/Ops or PM office", desc: "Your answers lean toward organizing people and process. Look at ops, PM, or coordinator roles." },
+  Engineering: { label: "Software Engineering / IT", office: "Engineering / IT Support office", desc: "You lean toward building, fixing, and supporting technical systems. Look at software, mobile, or IT/helpdesk roles." },
+  Data: { label: "Data & Analytics", office: "Data / Analytics office", desc: "You lean toward numbers and patterns. Look at data analyst, BI, or ML-adjacent roles." },
+  Design: { label: "UI/UX Design", office: "Design / Product team", desc: "You lean toward how things look and feel. Look at product or UI/UX design roles." },
+  Business: { label: "Business Operations", office: "Business/Ops or PM office", desc: "You lean toward organizing people and process. Look at ops, PM, or coordinator roles." },
 };
+
+// When questions come from AI, the "field" names are whatever specific
+// paths it invented from the student's skills (not necessarily one of
+// the 4 static keys above) — build a sensible generic description on
+// the fly if we don't have a canned one.
+function getFieldInfo(fieldName) {
+  if (FIELD_INFO[fieldName]) return FIELD_INFO[fieldName];
+  return {
+    label: fieldName,
+    office: "Related department/office",
+    desc: `Your answers leaned most toward ${fieldName}. Look for postings and offices related to this path.`,
+  };
+}
 
 const quizState = {
   index: 0,
-  answers: [],
+  questions: STATIC_QUIZ_QUESTIONS, // replaced with AI-tailored questions when available
+  picks: [],           // { text, field } per question, for the AI prompt / profile enrichment
+  tallies: {},         // { [field]: n } — built dynamically from whatever fields appear
   done: false,
-  resultField: null,   // fallback (keyword-group) result
+  resultField: null,   // fallback (tally-based) result
   aiAnalysis: null,    // { recommended_path, confidence, reasoning, alternative_paths, skills_to_develop }
-  questions: STATIC_QUIZ_QUESTIONS,
   loadingQuestions: false,
   analyzing: false,
 };
 
 // Calls the career-ai edge function. Returns null on any failure so
-// callers can fall back to the static/keyword-based behavior.
+// callers can fall back to the tally-based behavior.
 async function callCareerAI(action, extra) {
   try {
     const { data, error } = await sb.functions.invoke("career-ai", {
@@ -2344,39 +2413,43 @@ async function callCareerAI(action, extra) {
   }
 }
 
+// Basic sanity check on AI-generated questions before trusting them.
+function isValidAIQuestionSet(questions) {
+  return Array.isArray(questions) && questions.length >= 4 && questions.every((q) =>
+    q && typeof q.q === "string" &&
+    Array.isArray(q.options) && q.options.length === 2 &&
+    q.options.every((o) => o && typeof o.text === "string" && typeof o.field === "string")
+  );
+}
+
 async function startQuiz() {
   quizState.index = 0;
+  quizState.questions = STATIC_QUIZ_QUESTIONS;
+  quizState.picks = [];
+  quizState.tallies = {};
   quizState.done = false;
   quizState.resultField = null;
   quizState.aiAnalysis = null;
-  quizState.questions = STATIC_QUIZ_QUESTIONS;
+  quizState.analyzing = false;
   quizState.loadingQuestions = true;
   state.showQuiz = true;
   render();
 
+  // Ask the AI to tailor the "would you rather" pairs to the student's
+  // own skills/program, so the paths being compared are specific to
+  // them instead of always the same 4 generic buckets.
   const ai = await callCareerAI("generate_questions");
-  if (ai && Array.isArray(ai.questions) && ai.questions.length > 0) {
+  if (ai && isValidAIQuestionSet(ai.questions)) {
     quizState.questions = ai.questions;
   }
-  quizState.answers = quizState.questions.map(() => "");
   quizState.loadingQuestions = false;
   render();
 }
 
-// Fallback: scores the combined free-text answers against each domain
-// keyword group (with synonym expansion) and picks the strongest match.
-function scoreQuizAnswers(combinedText) {
-  const expanded = expandWithSynonyms(tokenize(combinedText));
-  const counts = {};
-  Object.keys(KEYWORD_GROUPS).forEach((group) => {
-    counts[group] = expanded.filter((t) => t === `_group_${group.toLowerCase()}`).length;
-  });
-  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-  return sorted[0][1] > 0 ? sorted[0][0] : "Engineering"; // sensible default if nothing matched
-}
+async function pickQuizOption(option) {
+  quizState.tallies[option.field] = (quizState.tallies[option.field] || 0) + 1;
+  quizState.picks.push({ text: option.text, field: option.field });
 
-async function submitQuizAnswer(text) {
-  quizState.answers[quizState.index] = text;
   if (quizState.index < quizState.questions.length - 1) {
     quizState.index += 1;
     render();
@@ -2386,17 +2459,18 @@ async function submitQuizAnswer(text) {
   quizState.analyzing = true;
   render();
 
-  const combined = quizState.answers.join(" ");
+  // Dominant field from the round-robin tally (ties broken by first-seen order).
+  const sorted = Object.entries(quizState.tallies).sort((a, b) => b[1] - a[1]);
+  quizState.resultField = sorted[0][0];
 
-  const ai = await callCareerAI("analyze", { answers: quizState.answers });
+  const ai = await callCareerAI("analyze", { traits: quizState.tallies, picks: quizState.picks });
   if (ai && ai.analysis && ai.analysis.recommended_path) {
     quizState.aiAnalysis = ai.analysis;
-  } else {
-    quizState.resultField = scoreQuizAnswers(combined); // fallback
   }
 
-  // Fold the quiz answers into the student's profile so the main
+  // Fold the picked statements into the student's profile so the main
   // TF-IDF matching engine (postings feed, fit %) reflects it too.
+  const combined = quizState.picks.map((p) => p.text).join(". ");
   const existing = profileState.interests || "";
   profileState.interests = existing ? `${existing} ${combined}` : combined;
   recomputeMatches();
@@ -2416,6 +2490,8 @@ function renderQuizScreen() {
   backBtn.addEventListener("click", () => {
     if (!quizState.done && quizState.index > 0) {
       quizState.index -= 1; // step back a question
+      const undone = quizState.picks.pop(); // undo that question's tally
+      if (undone) quizState.tallies[undone.field] -= 1;
       render();
     } else {
       state.showQuiz = false; // exit the quiz entirely
@@ -2432,7 +2508,7 @@ function renderQuizScreen() {
 
   if (quizState.loadingQuestions) {
     const loadingP = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:80px;");
-    loadingP.textContent = "Preparing your questions\u2026";
+    loadingP.textContent = "Tailoring questions to your skills\u2026";
     content.appendChild(loadingP);
   } else if (!quizState.done) {
     const q = quizState.questions[quizState.index];
@@ -2444,28 +2520,23 @@ function renderQuizScreen() {
 
     const progress = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 8px;");
     progress.textContent = `Question ${quizState.index + 1} of ${quizState.questions.length}`;
-    const qTitle = el("h2", "font-size:19px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;margin:0 0 16px;");
-    qTitle.textContent = q.q;
+    const qTitle = el("h2", "font-size:19px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;margin:0 0 20px;");
+    qTitle.textContent = quizState.analyzing ? "Analyzing your results\u2026" : q.q;
     content.appendChild(progress);
     content.appendChild(qTitle);
 
-    const textarea = el("textarea", inputStyleText() + "resize:none;line-height:1.5;min-height:120px;");
-    textarea.placeholder = q.placeholder || "";
-    textarea.value = quizState.answers[quizState.index] || "";
-    textarea.id = "quiz-answer-input";
-    textarea.disabled = quizState.analyzing;
-    textarea.addEventListener("input", (e) => { quizState.answers[quizState.index] = e.target.value; });
-    content.appendChild(textarea);
-
-    const nextBtn = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;");
-    const isLast = quizState.index === quizState.questions.length - 1;
-    nextBtn.textContent = quizState.analyzing ? "Analyzing\u2026" : (isLast ? "See My Result" : "Next");
-    nextBtn.disabled = quizState.analyzing;
-    nextBtn.addEventListener("click", () => {
-      const val = document.getElementById("quiz-answer-input").value;
-      submitQuizAnswer(val);
-    });
-    content.appendChild(nextBtn);
+    if (!quizState.analyzing) {
+      const optWrap = el("div", "display:flex;flex-direction:column;gap:12px;");
+      q.options.forEach((opt) => {
+        const btn = el("button", "text-align:left;padding:18px 16px;background:#FFFFFF;border:1.5px solid #E8E8E8;border-radius:14px;font-size:14px;color:#1B1B1B;cursor:pointer;line-height:1.4;");
+        btn.textContent = opt.text;
+        btn.addEventListener("mouseenter", () => { btn.style.borderColor = "#1D9E75"; });
+        btn.addEventListener("mouseleave", () => { btn.style.borderColor = "#E8E8E8"; });
+        btn.addEventListener("click", () => pickQuizOption(opt));
+        optWrap.appendChild(btn);
+      });
+      content.appendChild(optWrap);
+    }
   } else {
     const badge = el("div", "width:56px;height:56px;border-radius:16px;background:#E8F7F2;display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:16px;");
     badge.textContent = "\u2726";
@@ -2510,7 +2581,7 @@ function renderQuizScreen() {
       }
     } else {
       const top = quizState.resultField;
-      const info = FIELD_INFO[top];
+      const info = getFieldInfo(top);
       const resultLabel = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 6px;");
       resultLabel.textContent = "Your best fit";
       const resultTitle = el("h2", "font-size:22px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 10px;");

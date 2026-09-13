@@ -45,7 +45,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { action, profile, answers } = await req.json();
+    const { action, profile, traits, picks } = await req.json();
 
     if (action === "generate_questions") {
       const content = await callGroq([
@@ -53,13 +53,20 @@ Deno.serve(async (req: Request) => {
           role: "system",
           content:
             "You are a career counselor for college students choosing an OJT/internship path. " +
-            "Given a partial student profile, generate exactly 3 short, specific, fill-in-the-blank " +
-            "career questions (never multiple choice) that would help reveal which professional role " +
-            "fits them best. Tailor the questions to their program/skills if known. " +
-            'Respond with ONLY a JSON array like: [{"q": "question text", "placeholder": "example answer hint"}]. ' +
-            "No prose, no markdown fences, no extra keys.",
+            "Given the student's profile (program, skills, interests), invent 3-5 specific, relevant " +
+            "professional paths for someone with THIS skillset (e.g. if they list React/CSS, use paths " +
+            "like \"Frontend Development\" vs \"Backend Development\", not generic categories). " +
+            "Then generate exactly 8 forced-choice \"would you rather\" question pairs comparing those " +
+            "paths against each other (round-robin style, covering as many distinct pairs as possible, " +
+            "repeating a pair with a different scenario if needed to reach 8). " +
+            "Each option must be a short, concrete statement of a task (not a job title) representing " +
+            "one of the paths. If the student's skills are empty or too generic to specialize, fall back " +
+            "to broad paths: Engineering, Data, Design, Business. " +
+            'Respond with ONLY a JSON array like: [{"q": "Would you rather...", "options": ' +
+            '[{"text": "statement", "field": "Path Name"}, {"text": "statement", "field": "Path Name"}]}]. ' +
+            "Exactly 8 items, exactly 2 options per item. No prose, no markdown fences, no extra keys.",
         },
-        { role: "user", content: `Student profile so far: ${JSON.stringify(profile)}` },
+        { role: "user", content: `Student profile: ${JSON.stringify(profile)}` },
       ]);
       const questions = extractJson(content);
       return new Response(JSON.stringify({ questions }), {
@@ -73,16 +80,22 @@ Deno.serve(async (req: Request) => {
           role: "system",
           content:
             "You are a career counselor analyzing a college student's OJT/internship direction. " +
-            "Given their profile and free-text answers, respond with ONLY a JSON object like: " +
+            "The student answered 8 forced-choice \"would you rather\" questions comparing several " +
+            "possible professional paths (these may be broad categories or specific paths tailored to " +
+            "their own skills). You are given their tally per path (higher = stronger lean) and the " +
+            "exact statements they picked. " +
+            "Given their profile, tallies, and picks, respond with ONLY a JSON object like: " +
             '{"recommended_path": "specific job title", "confidence": "low|medium|high", ' +
             '"reasoning": "2-3 sentences", "alternative_paths": ["title1","title2"], ' +
             '"skills_to_develop": ["skill1","skill2"]}. ' +
             "recommended_path must be a specific role (e.g. \"Backend Developer\", \"Data Analyst\", " +
-            "\"QA Engineer\"), not a broad category. No prose, no markdown fences, no extra keys.",
+            "\"QA Engineer\"), not a broad category. Use the tallies as the primary signal, and the " +
+            "picked statements plus profile (skills/interests/program) to sharpen it into a specific " +
+            "role rather than just the broad category. No prose, no markdown fences, no extra keys.",
         },
         {
           role: "user",
-          content: `Profile: ${JSON.stringify(profile)}\n\nQuiz answers: ${JSON.stringify(answers)}`,
+          content: `Profile: ${JSON.stringify(profile)}\n\nTallies: ${JSON.stringify(traits)}\n\nPicked statements: ${JSON.stringify(picks)}`,
         },
       ]);
       const analysis = extractJson(content);
