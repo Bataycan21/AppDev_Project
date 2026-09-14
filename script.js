@@ -22,6 +22,7 @@ function mapPostingRow(row) {
     description: row.description,
     tags: row.tags || [],
     logo: row.logo,
+    logoUrl: c.logo_url || "",
     salary: row.salary || "",
     companyId: row.company_id,
     companyIndustry: c.industry || "",
@@ -121,7 +122,8 @@ async function routeAfterAuth() {
   const { data: { user } } = await sb.auth.getUser();
   if (!user) return;
 
-  contentEl.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ABABAB;font-size:13px;">Loading…</div>`;
+  contentEl.innerHTML = "";
+  contentEl.appendChild(skeletonFeedScreen());
 
   let { data: profileRows } = await sb.from("profiles").select("role").eq("id", user.id).limit(1);
   let role = profileRows && profileRows[0] ? profileRows[0].role : null;
@@ -151,7 +153,7 @@ async function routeAfterAuth() {
 async function loadStudentData() {
   const { data: postingRows } = await sb
     .from("postings")
-    .select("*, companies(industry,specialization,about,name)")
+    .select("*, companies(industry,specialization,about,name,logo_url)")
     .order("created_at");
   POSTINGS = (postingRows || []).map(mapPostingRow);
 
@@ -242,7 +244,8 @@ async function removeResume() {
 // ---------------------------------------------------------
 let companyName = "";
 let companyListings = [];
-const companyProfileState = { name: "", industry: "", industryInput: "", specialization: "", workType: "", about: "" };
+const companyProfileState = { name: "", industry: "", industryInput: "", specialization: "", workType: "", about: "", logoUrl: "", logoUploading: false };
+let companyLogoUrl = ""; // mirrors companyProfileState.logoUrl for quick use on postings/header
 
 async function loadCompanyListings() {
   const { data: companyRows } = await sb.from("companies").select("*").eq("id", companyId).limit(1);
@@ -254,6 +257,8 @@ async function loadCompanyListings() {
     companyProfileState.specialization = c.specialization || "";
     companyProfileState.workType = c.work_type || "";
     companyProfileState.about = c.about || "";
+    companyProfileState.logoUrl = c.logo_url || "";
+    companyLogoUrl = c.logo_url || "";
   }
   state.hasCompanyProfile = !!(c && c.industry);
 
@@ -275,7 +280,74 @@ async function persistCompanyProfile() {
   state.hasCompanyProfile = true;
 }
 
-const postingFormState = { id: null, role: "", location: "", summary: "", description: "", tags: [], tagInput: "", salary: "" };
+// ---------------------------------------------------------
+// Company logo upload — public bucket, so postings/cards can
+// show a real image instead of the generated letter avatar.
+// ---------------------------------------------------------
+async function uploadCompanyLogo(file) {
+  if (!companyId || !file) return;
+  if (!file.type.startsWith("image/")) {
+    alert("Please upload an image file (PNG, JPG, etc).");
+    return;
+  }
+  companyProfileState.logoUploading = true;
+  render();
+
+  const ext = (file.name.split(".").pop() || "png").toLowerCase();
+  const path = `${companyId}/logo-${Date.now()}.${ext}`;
+  const { error: uploadError } = await sb.storage
+    .from("logos")
+    .upload(path, file, { upsert: true, contentType: file.type });
+
+  if (uploadError) {
+    companyProfileState.logoUploading = false;
+    alert("Logo upload failed: " + uploadError.message);
+    render();
+    return;
+  }
+
+  const { data: urlData } = sb.storage.from("logos").getPublicUrl(path);
+  const publicUrl = urlData ? urlData.publicUrl : "";
+
+  await sb.from("companies").update({ logo_url: publicUrl }).eq("id", companyId);
+  companyProfileState.logoUrl = publicUrl;
+  companyLogoUrl = publicUrl;
+  companyProfileState.logoUploading = false;
+  render();
+}
+
+const CURRENCY_OPTIONS = [
+  { code: "PHP", symbol: "\u20b1", label: "\u20b1 PHP" },
+  { code: "USD", symbol: "$", label: "$ USD" },
+  { code: "EUR", symbol: "\u20ac", label: "\u20ac EUR" },
+  { code: "OTHER", symbol: "", label: "Other" },
+];
+
+const postingFormState = {
+  id: null, role: "", location: "", summary: "", description: "", tags: [], tagInput: "",
+  salaryCurrency: "PHP", salaryCustomSymbol: "", salaryAmount: "", salaryPeriod: "month", salaryUnpaid: false,
+};
+
+// Best-effort parse of an existing "\u20b18,000/month" style string back into
+// structured fields, so editing a posting pre-fills the dropdown sensibly.
+function parseSalaryString(str) {
+  const result = { currency: "PHP", customSymbol: "", amount: "", period: "month", unpaid: false };
+  if (!str) return result;
+  if (/unpaid|volunteer/i.test(str)) { result.unpaid = true; return result; }
+  const match = str.match(/([\u20b1$\u20ac]|PHP|USD|EUR)?\s*([\d,]+(?:\.\d+)?)\s*\/?\s*(month|day|hour)?/i);
+  if (!match) return result;
+  const symbolOrCode = (match[1] || "").toUpperCase();
+  const known = CURRENCY_OPTIONS.find((c) => c.symbol === match[1] || c.code === symbolOrCode);
+  if (known && known.code !== "OTHER") {
+    result.currency = known.code;
+  } else if (match[1]) {
+    result.currency = "OTHER";
+    result.customSymbol = match[1];
+  }
+  result.amount = (match[2] || "").replace(/,/g, "");
+  result.period = (match[3] || "month").toLowerCase();
+  return result;
+}
 
 function resetPostingForm(existing) {
   if (existing) {
@@ -285,7 +357,12 @@ function resetPostingForm(existing) {
     postingFormState.summary = existing.summary || "";
     postingFormState.description = existing.description || "";
     postingFormState.tags = [...existing.tags];
-    postingFormState.salary = existing.salary || "";
+    const parsed = parseSalaryString(existing.salary);
+    postingFormState.salaryCurrency = parsed.currency;
+    postingFormState.salaryCustomSymbol = parsed.customSymbol;
+    postingFormState.salaryAmount = parsed.amount;
+    postingFormState.salaryPeriod = parsed.period;
+    postingFormState.salaryUnpaid = parsed.unpaid;
   } else {
     postingFormState.id = null;
     postingFormState.role = "";
@@ -293,9 +370,27 @@ function resetPostingForm(existing) {
     postingFormState.summary = "";
     postingFormState.description = "";
     postingFormState.tags = [];
-    postingFormState.salary = "";
+    postingFormState.salaryCurrency = "PHP";
+    postingFormState.salaryCustomSymbol = "";
+    postingFormState.salaryAmount = "";
+    postingFormState.salaryPeriod = "month";
+    postingFormState.salaryUnpaid = false;
   }
   postingFormState.tagInput = "";
+}
+
+// Composes the structured salary fields into the single display string
+// stored in postings.salary (e.g. "\u20b18,000/month" or "Unpaid").
+function composeSalaryString() {
+  if (postingFormState.salaryUnpaid) return "Unpaid";
+  if (!postingFormState.salaryAmount) return "";
+  const opt = CURRENCY_OPTIONS.find((c) => c.code === postingFormState.salaryCurrency);
+  const symbol = postingFormState.salaryCurrency === "OTHER"
+    ? postingFormState.salaryCustomSymbol
+    : (opt ? opt.symbol : "");
+  const amountNum = Number(postingFormState.salaryAmount);
+  const formattedAmount = Number.isFinite(amountNum) ? amountNum.toLocaleString() : postingFormState.salaryAmount;
+  return `${symbol}${formattedAmount}/${postingFormState.salaryPeriod}`;
 }
 
 async function savePostingForm() {
@@ -308,7 +403,7 @@ async function savePostingForm() {
     tags: postingFormState.tags,
     logo: companyName.trim().charAt(0).toUpperCase() || "?",
     company_id: companyId,
-    salary: postingFormState.salary,
+    salary: composeSalaryString(),
   };
   if (postingFormState.id) {
     await sb.from("postings").update(payload).eq("id", postingFormState.id);
@@ -484,6 +579,21 @@ function el(tag, styleText, props) {
   return e;
 }
 
+// Builds a logo box: a real uploaded image if logoUrl is set, otherwise
+// the generated letter-avatar fallback. sizePx controls both dimensions
+// and is used to scale the fallback letter's font size sensibly.
+function logoElement(letter, logoUrl, sizePx, radiusPx) {
+  const r = radiusPx || Math.round(sizePx * 0.28);
+  const box = el("div", `width:${sizePx}px;height:${sizePx}px;border-radius:${r}px;background:#F4F4F4;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:${Math.round(sizePx * 0.4)}px;font-weight:700;color:#1B1B1B;overflow:hidden;`);
+  if (logoUrl) {
+    const img = el("img", "width:100%;height:100%;object-fit:cover;", { src: logoUrl, alt: "" });
+    box.appendChild(img);
+  } else {
+    box.textContent = letter;
+  }
+  return box;
+}
+
 // Icon-only circular back/return arrow button (matches the one used
 // on Posting Detail / Career Quiz), for consistent "return" affordance.
 function backArrowButton(onClick) {
@@ -491,6 +601,40 @@ function backArrowButton(onClick) {
   btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M15 18l-6-6 6-6" /></svg>`;
   btn.addEventListener("click", onClick);
   return btn;
+}
+
+// Shimmering placeholder screen shown while the app/tab is loading real
+// data, shaped like a feed of cards so it doesn't feel like a blank stall.
+function skeletonFeedScreen() {
+  const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;padding:20px 24px;");
+  const headerLine1 = el("div");
+  headerLine1.className = "skeleton";
+  headerLine1.style.cssText = "width:60%;height:14px;margin-bottom:10px;";
+  const headerLine2 = el("div");
+  headerLine2.className = "skeleton";
+  headerLine2.style.cssText = "width:40%;height:20px;margin-bottom:24px;";
+  root.appendChild(headerLine1);
+  root.appendChild(headerLine2);
+
+  for (let i = 0; i < 3; i++) {
+    const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
+    const row = el("div", "display:flex;gap:12px;align-items:flex-start;");
+    const avatar = el("div");
+    avatar.className = "skeleton";
+    avatar.style.cssText = "width:40px;height:40px;border-radius:10px;flex-shrink:0;";
+    const lines = el("div", "flex:1;");
+    const l1 = el("div"); l1.className = "skeleton"; l1.style.cssText = "width:50%;height:10px;margin-bottom:8px;";
+    const l2 = el("div"); l2.className = "skeleton"; l2.style.cssText = "width:80%;height:14px;margin-bottom:8px;";
+    const l3 = el("div"); l3.className = "skeleton"; l3.style.cssText = "width:65%;height:10px;";
+    lines.appendChild(l1);
+    lines.appendChild(l2);
+    lines.appendChild(l3);
+    row.appendChild(avatar);
+    row.appendChild(lines);
+    card.appendChild(row);
+    root.appendChild(card);
+  }
+  return root;
 }
 
 function scoreColor(fitScore, threeStep) {
@@ -587,6 +731,28 @@ function postingText(p) {
 
 function profileText(profile) {
   return [profile.skills.join(" "), profile.interests, profile.program].join(" ");
+}
+
+const STOP_SHORT = new Set(["the", "and", "for", "are", "you", "your", "with", "our", "this", "that", "will"]);
+
+// Explains *why* a posting scored the way it did: direct word overlaps
+// (e.g. shared skill names) plus synonym-group matches (e.g. "IT" on
+// the profile side matching "troubleshooting" on the posting side).
+function getMatchBreakdown(posting) {
+  const profileTokens = tokenize(profileText(profileState));
+  const postingTokens = tokenize(postingText(posting));
+  const profileSet = new Set(profileTokens);
+  const postingSet = new Set(postingTokens);
+
+  const directMatches = [...new Set(profileTokens.filter((t) =>
+    t.length > 2 && !STOP_SHORT.has(t) && postingSet.has(t)
+  ))].slice(0, 8);
+
+  const profileGroups = new Set(expandWithSynonyms(profileTokens).filter((t) => t.startsWith("_group_")));
+  const postingGroups = new Set(expandWithSynonyms(postingTokens).filter((t) => t.startsWith("_group_")));
+  const sharedGroupCount = [...profileGroups].filter((g) => postingGroups.has(g)).length;
+
+  return { directMatches, sharedGroupCount };
 }
 
 // Step 1: TF-IDF vectorization — converts skill/requirement text into
@@ -833,6 +999,28 @@ function renderCompanyOnboardingScreen(isEdit) {
   nameField.appendChild(nameInput);
   form.appendChild(nameField);
 
+  // Company logo (public bucket — shows on postings/cards once uploaded)
+  const logoField = el("div");
+  logoField.appendChild(labelEl("Company Logo (optional)"));
+  const logoRow = el("div", "display:flex;align-items:center;gap:12px;");
+  const logoPreview = logoElement(companyProfileState.name.trim().charAt(0).toUpperCase() || "?", companyProfileState.logoUrl, 56, 14);
+  logoRow.appendChild(logoPreview);
+
+  if (companyProfileState.logoUploading) {
+    const uploadingP = el("p", "font-size:12px;color:#8A8A8A;margin:0;");
+    uploadingP.textContent = "Uploading\u2026";
+    logoRow.appendChild(uploadingP);
+  } else {
+    const uploadLabel = el("label", "display:inline-flex;align-items:center;gap:6px;padding:9px 14px;background:#F0F0F0;border-radius:10px;cursor:pointer;color:#1B1B1B;font-size:12px;font-weight:600;");
+    uploadLabel.textContent = companyProfileState.logoUrl ? "Replace Logo" : "Upload Logo";
+    const logoInput = el("input", "display:none;", { type: "file", accept: "image/*" });
+    logoInput.addEventListener("change", (e) => { if (e.target.files[0]) uploadCompanyLogo(e.target.files[0]); });
+    uploadLabel.appendChild(logoInput);
+    logoRow.appendChild(uploadLabel);
+  }
+  logoField.appendChild(logoRow);
+  form.appendChild(logoField);
+
   // Industry (single select, with a manual type-in for anything not listed)
   const industryField = el("div");
   industryField.appendChild(labelEl("Industry"));
@@ -937,13 +1125,17 @@ function renderCompanyApp() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
 
   const header = el("div", "display:flex;align-items:center;justify-content:space-between;padding:20px 24px 12px;flex-shrink:0;");
-  const headLeft = el("div");
+  const headLeft = el("div", "display:flex;align-items:center;gap:12px;");
+  const headLogo = logoElement(companyName.trim().charAt(0).toUpperCase() || "?", companyLogoUrl, 44, 12);
+  const headTextBlock = el("div");
   const nameH1 = el("h1", "font-size:20px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.4px;");
   nameH1.textContent = companyName || "Company";
   const sub = el("p", "font-size:12px;color:#8A8A8A;margin:2px 0 0;");
   sub.textContent = `${companyProfileState.industry || "No industry set"} · ${companyListings.length} active listing${companyListings.length === 1 ? "" : "s"}`;
-  headLeft.appendChild(nameH1);
-  headLeft.appendChild(sub);
+  headTextBlock.appendChild(nameH1);
+  headTextBlock.appendChild(sub);
+  headLeft.appendChild(headLogo);
+  headLeft.appendChild(headTextBlock);
   const headRight = el("div", "display:flex;flex-direction:column;align-items:flex-end;gap:6px;");
   const editProfileBtn = el("button", "background:none;border:none;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
   editProfileBtn.textContent = "Edit Profile";
@@ -984,8 +1176,21 @@ function renderCompanyApp() {
   content.appendChild(newBtn);
 
   if (companyListings.length === 0) {
-    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
-    empty.textContent = "No listings yet. Post your first one!";
+    const empty = el("div", "display:flex;flex-direction:column;align-items:center;justify-content:center;padding-top:50px;gap:10px;");
+    const iconBox = el("div", "width:52px;height:52px;border-radius:16px;background:#F0F0F0;display:flex;align-items:center;justify-content:center;");
+    iconBox.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ABABAB" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>`;
+    const emptyText = el("p", "font-size:14px;color:#ABABAB;margin:0;text-align:center;");
+    emptyText.textContent = "No listings yet. Students can't see you until you post one.";
+    const postBtn = el("button", "margin-top:6px;padding:10px 20px;background:#1D9E75;border:none;border-radius:12px;color:#FFFFFF;font-size:13px;font-weight:600;cursor:pointer;");
+    postBtn.textContent = "+ Post Your First Listing";
+    postBtn.addEventListener("click", () => {
+      resetPostingForm(null);
+      state.companyView = "form";
+      render();
+    });
+    empty.appendChild(iconBox);
+    empty.appendChild(emptyText);
+    empty.appendChild(postBtn);
     content.appendChild(empty);
   }
 
@@ -1063,11 +1268,57 @@ function renderPostingForm() {
 
   const salaryField = el("div");
   salaryField.appendChild(labelEl("Salary / Allowance (optional)"));
-  const salaryInput = el("input", inputStyleText());
-  salaryInput.placeholder = "e.g. \u20b18,000/month, or Unpaid, or \u20b1500/day";
-  salaryInput.value = postingFormState.salary;
-  salaryInput.addEventListener("input", (e) => { postingFormState.salary = e.target.value; });
-  salaryField.appendChild(salaryInput);
+
+  const unpaidRow = el("label", "display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;font-size:13px;color:#1B1B1B;");
+  const unpaidCheckbox = el("input", "", { type: "checkbox", checked: postingFormState.salaryUnpaid });
+  unpaidCheckbox.addEventListener("change", (e) => { postingFormState.salaryUnpaid = e.target.checked; render(); });
+  unpaidRow.appendChild(unpaidCheckbox);
+  unpaidRow.appendChild(document.createTextNode("Unpaid / Volunteer"));
+  salaryField.appendChild(unpaidRow);
+
+  if (!postingFormState.salaryUnpaid) {
+    const row = el("div", "display:flex;gap:8px;");
+
+    const currencySelect = el("select", inputStyleText() + "flex:0 0 110px;");
+    CURRENCY_OPTIONS.forEach((c) => {
+      const opt = el("option", "", { value: c.code, textContent: c.label });
+      if (c.code === postingFormState.salaryCurrency) opt.selected = true;
+      currencySelect.appendChild(opt);
+    });
+    currencySelect.addEventListener("change", (e) => { postingFormState.salaryCurrency = e.target.value; render(); });
+    row.appendChild(currencySelect);
+
+    if (postingFormState.salaryCurrency === "OTHER") {
+      const symbolInput = el("input", inputStyleText() + "flex:0 0 60px;");
+      symbolInput.placeholder = "e.g. RM";
+      symbolInput.value = postingFormState.salaryCustomSymbol;
+      symbolInput.addEventListener("input", (e) => { postingFormState.salaryCustomSymbol = e.target.value; });
+      row.appendChild(symbolInput);
+    }
+
+    const amountInput = el("input", inputStyleText() + "flex:1;");
+    amountInput.type = "number";
+    amountInput.placeholder = "e.g. 8000";
+    amountInput.value = postingFormState.salaryAmount;
+    amountInput.addEventListener("input", (e) => { postingFormState.salaryAmount = e.target.value; });
+    row.appendChild(amountInput);
+
+    const periodSelect = el("select", inputStyleText() + "flex:0 0 100px;");
+    [["month", "/ month"], ["day", "/ day"], ["hour", "/ hour"]].forEach(([val, label]) => {
+      const opt = el("option", "", { value: val, textContent: label });
+      if (val === postingFormState.salaryPeriod) opt.selected = true;
+      periodSelect.appendChild(opt);
+    });
+    periodSelect.addEventListener("change", (e) => { postingFormState.salaryPeriod = e.target.value; });
+    row.appendChild(periodSelect);
+
+    salaryField.appendChild(row);
+
+    const preview = el("p", "font-size:12px;color:#8A8A8A;margin:8px 0 0;");
+    preview.textContent = postingFormState.salaryAmount ? `Shown as: ${composeSalaryString()}` : "";
+    salaryField.appendChild(preview);
+  }
+
   wrap.appendChild(salaryField);
 
   const sumField = el("div");
@@ -1593,6 +1844,7 @@ function renderPostingCard(posting, rank) {
   const sColor = scoreColor(fitScore, false);
 
   const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04);cursor:pointer;position:relative;");
+  card.className = "lift-card";
   card.addEventListener("click", () => {
     state.selectedPostingId = posting.id;
     resetApplyForm();
@@ -1606,8 +1858,7 @@ function renderPostingCard(posting, rank) {
   }
 
   const row = el("div", "display:flex;align-items:flex-start;gap:12px;");
-  const logo = el("div", "width:40px;height:40px;border-radius:10px;background:#F4F4F4;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:16px;font-weight:700;color:#1B1B1B;");
-  logo.textContent = posting.logo;
+  const logo = logoElement(posting.logo, posting.logoUrl, 40, 10);
 
   const info = el("div", "flex:1;min-width:0;");
 
@@ -1759,8 +2010,7 @@ function renderPostingDetailScreen(posting) {
   // Company + role card
   const card1 = el("div", "background:#FFFFFF;border-radius:16px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
   const row1 = el("div", "display:flex;align-items:center;gap:14px;margin-bottom:14px;");
-  const logo = el("div", "width:52px;height:52px;border-radius:14px;background:#F4F4F4;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#1B1B1B;");
-  logo.textContent = posting.logo;
+  const logo = logoElement(posting.logo, posting.logoUrl, 52, 14);
   const nameBlock = el("div");
   const companyP = el("p", "margin:0;font-size:12px;color:#8A8A8A;font-weight:500;");
   companyP.textContent = posting.company;
@@ -1804,6 +2054,36 @@ function renderPostingDetailScreen(posting) {
   card2.appendChild(h3a);
   card2.appendChild(tagsRow);
   content.appendChild(card2);
+
+  // Why this match — visual breakdown behind the fit %
+  const breakdown = getMatchBreakdown(posting);
+  if (breakdown.directMatches.length > 0 || breakdown.sharedGroupCount > 0) {
+    const card2b = el("div", "background:#FFFFFF;border-radius:16px;padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+    const h3why = el("h3", "margin:0 0 12px;font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;");
+    h3why.textContent = "Why This Match";
+    card2b.appendChild(h3why);
+
+    if (breakdown.directMatches.length > 0) {
+      const label = el("p", "margin:0 0 8px;font-size:12px;color:#6A6A6A;");
+      label.textContent = "Matched directly from your profile:";
+      const chipRow = el("div", "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;");
+      breakdown.directMatches.forEach((word) => {
+        const chip = el("span", "display:inline-flex;align-items:center;gap:4px;background:#E8F7F2;color:#1D9E75;font-size:12px;font-weight:600;padding:4px 10px;border-radius:20px;");
+        chip.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="3" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>${word}`;
+        chipRow.appendChild(chip);
+      });
+      card2b.appendChild(label);
+      card2b.appendChild(chipRow);
+    }
+
+    if (breakdown.sharedGroupCount > 0) {
+      const relatedNote = el("p", "margin:0;font-size:12px;color:#6A6A6A;display:flex;align-items:center;gap:6px;");
+      relatedNote.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#D98A00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>+ ${breakdown.sharedGroupCount} related-skill match${breakdown.sharedGroupCount === 1 ? "" : "es"} (e.g. related tools/terms in the same field)`;
+      card2b.appendChild(relatedNote);
+    }
+
+    content.appendChild(card2b);
+  }
 
   // Description
   const card3 = el("div", "background:#FFFFFF;border-radius:16px;padding:18px 20px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
@@ -1873,8 +2153,9 @@ function renderPostingDetailScreen(posting) {
   const ctaWrap = el("div", "padding:12px 24px 20px;background:#FAFAFA;border-top:1px solid #EFEFEF;flex-shrink:0;");
   const canApply = applied || applyFormState.useProfileResume || !!applyFormState.file;
   const applyBtn = el("button", `width:100%;padding:15px;background:${applied ? "#E8F7F2" : "#1D9E75"};border:none;border-radius:14px;color:${applied ? "#1D9E75" : "#FFFFFF"};font-size:15px;font-weight:600;cursor:${applied || !canApply ? "default" : "pointer"};letter-spacing:-0.2px;transition:background 0.2s ease;opacity:${!applied && !canApply ? 0.5 : 1};`);
+  if (applied) applyBtn.className = "pop-in";
   applyBtn.textContent = applied
-    ? "Application Submitted"
+    ? "\u2713 Application Submitted"
     : applyFormState.uploading
       ? "Uploading Resume\u2026"
       : "Apply Now";
@@ -1931,9 +2212,13 @@ function renderMatchesScreen() {
         <path d="M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9 9 4.03 9 9z" />
       </svg>`;
     const emptyText = el("p", "font-size:14px;color:#ABABAB;margin:0;text-align:center;");
-    emptyText.innerHTML = "No applications yet.<br />Apply to postings from the Home tab.";
+    emptyText.innerHTML = "No applications yet.<br />Apply to postings that fit your skills.";
+    const browseBtn = el("button", "margin-top:6px;padding:10px 20px;background:#1D9E75;border:none;border-radius:12px;color:#FFFFFF;font-size:13px;font-weight:600;cursor:pointer;");
+    browseBtn.textContent = "Browse Postings \u2192";
+    browseBtn.addEventListener("click", () => { state.activeTab = "home"; render(); });
     empty.appendChild(iconBox);
     empty.appendChild(emptyText);
+    empty.appendChild(browseBtn);
     list.appendChild(empty);
   } else {
     allMatches.forEach((match) => {
@@ -1945,8 +2230,7 @@ function renderMatchesScreen() {
         render();
       });
 
-      const logo = el("div", "width:40px;height:40px;border-radius:10px;background:#F4F4F4;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#1B1B1B;flex-shrink:0;");
-      logo.textContent = match.logo;
+      const logo = logoElement(match.logo, match.logoUrl, 40, 10);
 
       const info = el("div", "flex:1;min-width:0;");
       const topRow = el("div", "display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;");
@@ -2292,6 +2576,7 @@ function renderNotificationsScreen() {
     topRow.appendChild(titleSpan);
     if (!notif.read) {
       const dot = el("div", "width:6px;height:6px;border-radius:50%;background:#1D9E75;flex-shrink:0;margin-top:4px;margin-left:6px;");
+      dot.className = "pulse-dot";
       topRow.appendChild(dot);
     }
     const bodyP = el("p", "margin:0 0 6px;font-size:12px;color:#6A6A6A;line-height:1.5;");
@@ -2688,7 +2973,8 @@ function renderBottomNav() {
 // Init — always land on the login page first, even if a session
 // was previously persisted (no silent auto-login on reopen).
 // ---------------------------------------------------------
-contentEl.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ABABAB;font-size:13px;">Loading SkillMatch…</div>`;
+contentEl.innerHTML = "";
+contentEl.appendChild(skeletonFeedScreen());
 sb.auth.signOut().finally(() => {
   studentId = null;
   companyId = null;

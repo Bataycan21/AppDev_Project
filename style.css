@@ -191,3 +191,52 @@
   }
 
   /* scrollbar hide for suggestion lists etc. handled generically */
+
+  /* ---------- Micro-interactions ---------- */
+  button {
+    transition: transform 0.08s ease, opacity 0.15s ease;
+  }
+  button:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  /* ---------- Skeleton loaders ---------- */
+  @keyframes skeleton-shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .skeleton {
+    background: linear-gradient(90deg, #EEEEEE 25%, #F5F5F5 37%, #EEEEEE 63%);
+    background-size: 400% 100%;
+    animation: skeleton-shimmer 1.4s ease infinite;
+    border-radius: 8px;
+  }
+
+  /* ---------- Pop-in (e.g. successful apply, quiz result badge) ---------- */
+  @keyframes pop-in {
+    0% { transform: scale(0.85); opacity: 0; }
+    60% { transform: scale(1.04); opacity: 1; }
+    100% { transform: scale(1); }
+  }
+  .pop-in {
+    animation: pop-in 0.32s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  }
+
+  /* ---------- Pulsing unread dot ---------- */
+  @keyframes pulse-dot {
+    0% { box-shadow: 0 0 0 0 rgba(29, 158, 117, 0.45); }
+    70% { box-shadow: 0 0 0 6px rgba(29, 158, 117, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(29, 158, 117, 0); }
+  }
+  .pulse-dot {
+    animation: pulse-dot 1.8s ease-out infinite;
+  }
+
+  /* ---------- Card hover lift (desktop) ---------- */
+  .lift-card {
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .lift-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+  }
