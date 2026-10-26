@@ -5,6 +5,9 @@
 
 const SUPABASE_URL = "https://noluueokvovoxtkvpusm.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5vbHV1ZW9rdm92b3h0a3ZwdXNtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NDkyNzgsImV4cCI6MjEwMzIyNTI3OH0.ydJfA5ZajXJv9E-3FDMl5EP9KHVIenubImfKE5i4eV4";
+const inviteHash = window.location.hash;
+const isInviteLink = /type=invite/.test(inviteHash) && /access_token=/.test(inviteHash);
+const inviteLinkError = /error_code=/.test(inviteHash) ? "That invite link is invalid or has expired. Ask your company to resend it." : "";
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let POSTINGS = [];
@@ -110,6 +113,11 @@ async function signOut() {
   companyApplicants = [];
   applicantsForPostingId = null;
   coordinatorApplications = [];
+  coordinatorAssignments = [];
+  coordinatorPostings = [];
+  coordinatorTab = "listings";
+  companyCoordinator = null;
+  unsubscribeCoordinatorListings();
   render();
 }
 
@@ -130,7 +138,7 @@ async function routeAfterAuth() {
 
   if (!role) {
     const meta = user.user_metadata || {};
-    role = meta.pending_role || "student";
+    role = meta.pending_role === "company" ? "company" : "student";
     await createProfileAfterSignup(user.id, role, meta.pending_company_name || "");
   }
 
@@ -141,6 +149,7 @@ async function routeAfterAuth() {
   } else if (role === "coordinator") {
     state.session = { userId: user.id, role: "coordinator", email: user.email };
     await loadCoordinatorData();
+    subscribeCoordinatorListings();
   } else {
     studentId = user.id;
     state.session = { userId: user.id, role: "student", email: user.email };
@@ -264,6 +273,7 @@ async function loadCompanyListings() {
 
   const { data: rows } = await sb.from("postings").select("*").eq("company_id", companyId).order("created_at");
   companyListings = (rows || []).map(mapPostingRow);
+  await loadCompanyCoordinator();
 }
 
 // Persists the company's name/industry/specialization/work-type/about.
@@ -421,6 +431,153 @@ async function deleteCompanyPosting(id) {
   render();
 }
 
+let companyCoordinator = null;
+const coordinatorFormState = { email: "", error: "", info: "", busy: false };
+
+async function loadCompanyCoordinator() {
+  const { data } = await sb
+    .from("coordinator_assignments")
+    .select("id, coordinator_email, coordinator_id")
+    .eq("company_id", companyId)
+    .limit(1);
+  companyCoordinator = data && data[0] ? data[0] : null;
+}
+
+async function callInviteCoordinator(payload) {
+  const { data, error } = await sb.functions.invoke("invite-coordinator", {
+    body: { ...payload, redirectTo: window.location.origin + window.location.pathname },
+  });
+  if (!error) return { data };
+  let message = error.message;
+  try {
+    const body = await error.context.json();
+    if (body && body.error) message = body.error;
+  } catch (e) {}
+  return { error: message };
+}
+
+async function assignCoordinator() {
+  const email = coordinatorFormState.email.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    coordinatorFormState.error = "Enter a valid email address.";
+    render();
+    return;
+  }
+  coordinatorFormState.busy = true;
+  coordinatorFormState.error = "";
+  coordinatorFormState.info = "";
+  render();
+  const { data, error } = await callInviteCoordinator({ email });
+  coordinatorFormState.busy = false;
+  if (error) {
+    coordinatorFormState.error = error;
+    render();
+    return;
+  }
+  coordinatorFormState.email = "";
+  coordinatorFormState.info = data && data.status === "linked"
+    ? "They already have a coordinator account and can now see your listings."
+    : `Invite sent to ${email}.`;
+  await loadCompanyCoordinator();
+  render();
+}
+
+async function resendCoordinatorInvite() {
+  if (!companyCoordinator) return;
+  coordinatorFormState.busy = true;
+  coordinatorFormState.error = "";
+  coordinatorFormState.info = "";
+  render();
+  const { error } = await callInviteCoordinator({ email: companyCoordinator.coordinator_email, resend: true });
+  coordinatorFormState.busy = false;
+  if (error) coordinatorFormState.error = error;
+  else coordinatorFormState.info = `Invite resent to ${companyCoordinator.coordinator_email}.`;
+  render();
+}
+
+async function removeCoordinator() {
+  if (!companyCoordinator) return;
+  const { error } = await sb.from("coordinator_assignments").delete().eq("id", companyCoordinator.id);
+  if (error) {
+    coordinatorFormState.error = error.message;
+    render();
+    return;
+  }
+  coordinatorFormState.info = "";
+  await loadCompanyCoordinator();
+  render();
+}
+
+function renderCoordinatorAssignScreen() {
+  const wrap = el("div", "flex:1;overflow-y:auto;padding:0 24px 24px;display:flex;flex-direction:column;gap:14px;");
+
+  const backRow = el("div", "padding-top:16px;margin-bottom:-4px;");
+  backRow.appendChild(backArrowButton(() => { state.companyView = "list"; render(); }));
+  wrap.appendChild(backRow);
+
+  const title = el("h2", "font-size:18px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.4px;");
+  title.textContent = "Your Coordinator";
+  wrap.appendChild(title);
+
+  const intro = el("p", "font-size:13px;color:#8A8A8A;margin:0;line-height:1.5;");
+  intro.textContent = "Invite a coordinator by email. They get a link to set a password, then see your new listings and review applications to them.";
+  wrap.appendChild(intro);
+
+  const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);display:flex;flex-direction:column;gap:12px;");
+
+  if (companyCoordinator) {
+    const emailP = el("p", "font-size:14px;font-weight:600;color:#1B1B1B;margin:0;word-break:break-all;");
+    emailP.textContent = companyCoordinator.coordinator_email;
+    const active = !!companyCoordinator.coordinator_id;
+    const statusChip = el("span", `align-self:flex-start;font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;color:${active ? "#1D9E75" : "#D98A00"};background:${active ? "#E8F7F2" : "#FFF6E0"};`);
+    statusChip.textContent = active ? "Active" : "Invite sent — waiting for them to accept";
+    card.appendChild(emailP);
+    card.appendChild(statusChip);
+
+    if (!active) {
+      const resendBtn = el("button", "padding:11px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:13px;font-weight:600;cursor:pointer;");
+      resendBtn.textContent = coordinatorFormState.busy ? "Sending..." : "Resend Invite";
+      resendBtn.disabled = coordinatorFormState.busy;
+      resendBtn.addEventListener("click", resendCoordinatorInvite);
+      card.appendChild(resendBtn);
+    }
+
+    const removeBtn = el("button", "padding:11px 0;background:#FFF0F0;border:none;border-radius:10px;color:#DC2626;font-size:13px;font-weight:600;cursor:pointer;");
+    removeBtn.textContent = active ? "Remove Coordinator" : "Cancel Invite";
+    removeBtn.addEventListener("click", () => {
+      if (confirm(active ? "Remove this coordinator? They will lose access to your listings and applications." : "Cancel this invite?")) removeCoordinator();
+    });
+    card.appendChild(removeBtn);
+  } else {
+    card.appendChild(labelEl("Coordinator Email"));
+    const input = el("input", inputStyleText());
+    input.type = "email";
+    input.placeholder = "coordinator@school.edu";
+    input.value = coordinatorFormState.email;
+    input.addEventListener("input", (e) => { coordinatorFormState.email = e.target.value; });
+    const inviteBtn = el("button", "width:100%;padding:13px;background:#1D9E75;border:none;border-radius:12px;color:#FFFFFF;font-size:14px;font-weight:600;cursor:pointer;");
+    inviteBtn.textContent = coordinatorFormState.busy ? "Sending..." : "Send Invite";
+    inviteBtn.disabled = coordinatorFormState.busy;
+    inviteBtn.addEventListener("click", assignCoordinator);
+    card.appendChild(input);
+    card.appendChild(inviteBtn);
+  }
+
+  if (coordinatorFormState.info) {
+    const info = el("p", "font-size:12px;color:#1D9E75;margin:0;");
+    info.textContent = coordinatorFormState.info;
+    card.appendChild(info);
+  }
+  if (coordinatorFormState.error) {
+    const err = el("p", "font-size:12px;color:#DC2626;margin:0;");
+    err.textContent = coordinatorFormState.error;
+    card.appendChild(err);
+  }
+
+  wrap.appendChild(card);
+  return wrap;
+}
+
 // ---------------------------------------------------------
 // Company: view applicants to one of their own postings
 // ---------------------------------------------------------
@@ -473,12 +630,37 @@ async function setApplicationStatus(applicationId, newStatus) {
 // ---------------------------------------------------------
 let coordinatorApplications = []; // [{ id, status, appliedAt, student, posting }]
 
+let coordinatorAssignments = [];
+let coordinatorPostings = [];
+let coordinatorTab = "listings";
+let coordinatorChannel = null;
+
 async function loadCoordinatorData() {
-  const { data } = await sb
-    .from("applications")
-    .select("id, status, applied_at, resume_path, resume_filename, students(name, program, year_level, skills, resume_path, resume_filename), postings(role, company, location)")
-    .order("applied_at", { ascending: false });
-  coordinatorApplications = (data || []).map((row) => {
+  const { data: assignRows } = await sb
+    .from("coordinator_assignments")
+    .select("company_id, last_seen_at")
+    .eq("coordinator_id", state.session.userId);
+  coordinatorAssignments = (assignRows || []).map((a) => ({ companyId: a.company_id, lastSeenAt: a.last_seen_at }));
+  const companyIds = coordinatorAssignments.map((a) => a.companyId);
+
+  if (companyIds.length === 0) {
+    coordinatorApplications = [];
+    coordinatorPostings = [];
+    return;
+  }
+
+  const [appsRes, postsRes] = await Promise.all([
+    sb.from("applications")
+      .select("id, status, applied_at, resume_path, resume_filename, students(name, program, year_level, skills, resume_path, resume_filename), postings!inner(role, company, location, company_id)")
+      .in("postings.company_id", companyIds)
+      .order("applied_at", { ascending: false }),
+    sb.from("postings")
+      .select("id, company, role, location, salary, tags, company_id, created_at")
+      .in("company_id", companyIds)
+      .order("created_at", { ascending: false }),
+  ]);
+
+  coordinatorApplications = (appsRes.data || []).map((row) => {
     const s = row.students || {};
     return {
       id: row.id,
@@ -492,12 +674,67 @@ async function loadCoordinatorData() {
       posting: row.postings || {},
     };
   });
+
+  coordinatorPostings = (postsRes.data || []).map((r) => ({
+    id: r.id,
+    company: r.company,
+    role: r.role,
+    location: r.location,
+    salary: r.salary || "",
+    tags: r.tags || [],
+    companyId: r.company_id,
+    createdAt: r.created_at,
+  }));
+}
+
+function subscribeCoordinatorListings() {
+  if (coordinatorChannel) return;
+  coordinatorChannel = sb
+    .channel("coordinator-postings")
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "postings" }, async (payload) => {
+      if (!coordinatorAssignments.some((a) => a.companyId === payload.new.company_id)) return;
+      await loadCoordinatorData();
+      render();
+    })
+    .subscribe();
+}
+
+function unsubscribeCoordinatorListings() {
+  if (!coordinatorChannel) return;
+  sb.removeChannel(coordinatorChannel);
+  coordinatorChannel = null;
+}
+
+function isNewListing(p) {
+  const a = coordinatorAssignments.find((x) => x.companyId === p.companyId);
+  return !!a && new Date(p.createdAt) > new Date(a.lastSeenAt);
+}
+
+function newListingCount() {
+  return coordinatorPostings.filter(isNewListing).length;
+}
+
+async function markListingsSeen() {
+  await sb.rpc("mark_postings_seen");
+  await loadCoordinatorData();
+  render();
+}
+
+function resumeButton(s) {
+  const btn = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;margin-bottom:12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
+  btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+  const label = el("span");
+  label.textContent = s.resume_filename ? `View Resume — ${s.resume_filename}` : "View Resume";
+  btn.appendChild(label);
+  btn.addEventListener("click", () => viewResume(s.resume_path));
+  return btn;
 }
 
 // ---------------------------------------------------------
 // Global app state
 // ---------------------------------------------------------
 const state = {
+  settingPassword: false,
   session: null,          // { userId, role: "student" | "company" }
   hasCompanyProfile: false,
   companyView: "list",    // list | form | profile  (company dashboard sub-view)
@@ -519,7 +756,7 @@ function render() {
   contentEl.innerHTML = "";
 
   if (!state.session) {
-    contentEl.appendChild(renderAuthScreen());
+    contentEl.appendChild(state.settingPassword ? renderSetPasswordScreen() : renderAuthScreen());
     return;
   }
 
@@ -857,7 +1094,7 @@ function renderAuthScreen() {
   // Role toggle (only relevant for sign up)
   if (authState.mode === "signup") {
     const roleRow = el("div", "display:flex;gap:8px;margin-bottom:18px;");
-    [["student", "Student"], ["company", "Company"], ["coordinator", "Coordinator"]].forEach(([val, label]) => {
+    [["student", "Student"], ["company", "Company"]].forEach(([val, label]) => {
       const active = authState.role === val;
       const btn = el("button", `flex:1;padding:12px 0;border-radius:10px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:13px;font-weight:600;cursor:pointer;`);
       btn.textContent = label;
@@ -937,6 +1174,93 @@ function renderAuthScreen() {
   });
   switchRow.appendChild(switchLink);
   form.appendChild(switchRow);
+
+  root.appendChild(form);
+  return root;
+}
+
+const setPasswordState = { password: "", confirm: "", error: "", busy: false };
+
+async function submitNewPassword() {
+  if (setPasswordState.password.length < 6) {
+    setPasswordState.error = "Use at least 6 characters.";
+    render();
+    return;
+  }
+  if (setPasswordState.password !== setPasswordState.confirm) {
+    setPasswordState.error = "Passwords don't match.";
+    render();
+    return;
+  }
+  setPasswordState.busy = true;
+  setPasswordState.error = "";
+  render();
+  const { error } = await sb.auth.updateUser({ password: setPasswordState.password });
+  setPasswordState.busy = false;
+  if (error) {
+    setPasswordState.error = error.message;
+    render();
+    return;
+  }
+  setPasswordState.password = "";
+  setPasswordState.confirm = "";
+  state.settingPassword = false;
+  await routeAfterAuth();
+}
+
+function renderSetPasswordScreen() {
+  const root = el("div", "flex:1;overflow-y:auto;background:#FAFAFA;display:flex;flex-direction:column;padding:0 24px;");
+
+  const top = el("div", "padding-top:48px;margin-bottom:28px;");
+  const brand = el("div", "display:inline-flex;align-items:center;gap:6px;margin-bottom:24px;");
+  const logoBox = el("div", "width:28px;height:28px;border-radius:8px;background:#1D9E75;display:flex;align-items:center;justify-content:center;");
+  logoBox.innerHTML = '<span style="font-size:14px;font-weight:700;color:#FFF;">S</span>';
+  const brandName = el("span", "font-size:17px;font-weight:700;color:#1B1B1B;letter-spacing:-0.4px;");
+  brandName.textContent = "SkillMatch";
+  brand.appendChild(logoBox);
+  brand.appendChild(brandName);
+  const h1 = el("h1", "font-size:24px;font-weight:700;color:#1B1B1B;letter-spacing:-0.5px;margin:0 0 6px;");
+  h1.textContent = "Set your password";
+  const sub = el("p", "font-size:13px;color:#8A8A8A;margin:0;line-height:1.5;");
+  sub.textContent = "Welcome! Create a password to finish setting up your coordinator account.";
+  top.appendChild(brand);
+  top.appendChild(h1);
+  top.appendChild(sub);
+  root.appendChild(top);
+
+  const form = el("div", "display:flex;flex-direction:column;gap:14px;");
+
+  const pwField = el("div");
+  pwField.appendChild(labelEl("Password"));
+  const pwInput = el("input", inputStyleText());
+  pwInput.type = "password";
+  pwInput.placeholder = "••••••••";
+  pwInput.value = setPasswordState.password;
+  pwInput.addEventListener("input", (e) => { setPasswordState.password = e.target.value; });
+  pwField.appendChild(pwInput);
+  form.appendChild(pwField);
+
+  const confirmField = el("div");
+  confirmField.appendChild(labelEl("Confirm Password"));
+  const confirmInput = el("input", inputStyleText());
+  confirmInput.type = "password";
+  confirmInput.placeholder = "••••••••";
+  confirmInput.value = setPasswordState.confirm;
+  confirmInput.addEventListener("input", (e) => { setPasswordState.confirm = e.target.value; });
+  confirmField.appendChild(confirmInput);
+  form.appendChild(confirmField);
+
+  if (setPasswordState.error) {
+    const err = el("p", "font-size:12px;color:#DC2626;margin:0;");
+    err.textContent = setPasswordState.error;
+    form.appendChild(err);
+  }
+
+  const submitBtn = el("button", "width:100%;padding:15px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;letter-spacing:-0.2px;margin-top:4px;");
+  submitBtn.textContent = setPasswordState.busy ? "Saving..." : "Continue";
+  submitBtn.disabled = setPasswordState.busy;
+  submitBtn.addEventListener("click", submitNewPassword);
+  form.appendChild(submitBtn);
 
   root.appendChild(form);
   return root;
@@ -1143,7 +1467,16 @@ function renderCompanyApp() {
   const signOutBtn = el("button", "background:none;border:none;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
   signOutBtn.textContent = "Sign Out";
   signOutBtn.addEventListener("click", signOut);
+  const coordinatorBtn = el("button", "background:none;border:none;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
+  coordinatorBtn.textContent = "Coordinator";
+  coordinatorBtn.addEventListener("click", () => {
+    coordinatorFormState.error = "";
+    coordinatorFormState.info = "";
+    state.companyView = "coordinator";
+    render();
+  });
   headRight.appendChild(editProfileBtn);
+  headRight.appendChild(coordinatorBtn);
   headRight.appendChild(signOutBtn);
   header.appendChild(headLeft);
   header.appendChild(headRight);
@@ -1156,6 +1489,11 @@ function renderCompanyApp() {
 
   if (state.companyView === "form") {
     root.appendChild(renderPostingForm());
+    return root;
+  }
+
+  if (state.companyView === "coordinator") {
+    root.appendChild(renderCoordinatorAssignScreen());
     return root;
   }
 
@@ -1456,10 +1794,7 @@ function renderApplicantsScreen() {
     }
 
     if (s.resume_path) {
-      const resumeRow = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;margin-bottom:12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
-      resumeRow.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span>View Resume${s.resume_filename ? " — " + s.resume_filename : ""}</span>`;
-      resumeRow.addEventListener("click", () => viewResume(s.resume_path));
-      card.appendChild(resumeRow);
+      card.appendChild(resumeButton(s));
     } else {
       const noResume = el("p", "font-size:11px;color:#ABABAB;margin:0 0 12px;");
       noResume.textContent = "No resume uploaded.";
@@ -1487,15 +1822,92 @@ function renderApplicantsScreen() {
 // Coordinator Dashboard — read across all applications, give
 // final approval/rejection sign-off.
 // ===========================================================
+function coordinatorListingCard(p) {
+  const fresh = isNewListing(p);
+  const card = el("div", `background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);${fresh ? "border:1.5px solid #1D9E75;" : ""}`);
+
+  const topRow = el("div", "display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px;");
+  const roleH3 = el("h3", "font-size:15px;font-weight:600;color:#1B1B1B;margin:0;letter-spacing:-0.2px;");
+  roleH3.textContent = p.role;
+  topRow.appendChild(roleH3);
+  if (fresh) {
+    const badge = el("span", "display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;color:#1D9E75;background:#E8F7F2;padding:3px 8px;border-radius:20px;flex-shrink:0;");
+    const dot = el("span", "width:6px;height:6px;border-radius:50%;background:#1D9E75;");
+    dot.classList.add("pulse-dot");
+    badge.appendChild(dot);
+    badge.appendChild(document.createTextNode("NEW"));
+    topRow.appendChild(badge);
+  }
+  card.appendChild(topRow);
+
+  const metaP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 10px;");
+  metaP.textContent = [p.company, p.location, p.salary].filter(Boolean).join(" · ");
+  card.appendChild(metaP);
+
+  if (p.tags.length > 0) {
+    const tagsRow = el("div", "display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;");
+    p.tags.forEach((t) => {
+      const chip = el("span", "background:#F4F4F4;color:#1B1B1B;font-size:11px;padding:3px 9px;border-radius:20px;");
+      chip.textContent = t;
+      tagsRow.appendChild(chip);
+    });
+    card.appendChild(tagsRow);
+  }
+
+  const posted = el("p", "font-size:11px;color:#ABABAB;margin:0;");
+  posted.textContent = `Posted ${timeAgo(p.createdAt)}`;
+  card.appendChild(posted);
+  return card;
+}
+
+function coordinatorApplicationCard(app) {
+  const s = app.student || {};
+  const p = app.posting || {};
+  const style = APPLICANT_STATUS_STYLES[app.status] || APPLICANT_STATUS_STYLES["Pending"];
+  const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+
+  const topRow = el("div", "display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px;");
+  const nameH3 = el("h3", "font-size:14px;font-weight:600;color:#1B1B1B;margin:0;letter-spacing:-0.2px;");
+  nameH3.textContent = s.name || "(no name set)";
+  const statusChip = el("span", `font-size:10px;font-weight:600;color:${style.color};background:${style.bg};padding:3px 8px;border-radius:20px;flex-shrink:0;white-space:nowrap;`);
+  statusChip.textContent = app.status;
+  topRow.appendChild(nameH3);
+  topRow.appendChild(statusChip);
+  card.appendChild(topRow);
+
+  const roleP = el("p", "font-size:12px;color:#1B1B1B;margin:0 0 2px;font-weight:500;");
+  roleP.textContent = `${p.role || ""} · ${p.company || ""}`;
+  const progP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 12px;");
+  progP.textContent = `${s.program || "No program set"} · ${s.year_level || "—"} Year`;
+  card.appendChild(roleP);
+  card.appendChild(progP);
+
+  if (s.resume_path) card.appendChild(resumeButton(s));
+
+  const actionsRow = el("div", "display:flex;gap:8px;");
+  const approveBtn = el("button", "flex:1;padding:9px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;");
+  approveBtn.textContent = "Approve";
+  approveBtn.addEventListener("click", () => setApplicationStatus(app.id, "Approved by Coordinator"));
+  const rejectBtn = el("button", "flex:1;padding:9px 0;background:#FFF0F0;border:none;border-radius:10px;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;");
+  rejectBtn.textContent = "Reject";
+  rejectBtn.addEventListener("click", () => setApplicationStatus(app.id, "Rejected"));
+  actionsRow.appendChild(approveBtn);
+  actionsRow.appendChild(rejectBtn);
+  card.appendChild(actionsRow);
+  return card;
+}
+
 function renderCoordinatorApp() {
   const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
+  const newCount = newListingCount();
+  const appCount = coordinatorApplications.length;
 
   const header = el("div", "display:flex;align-items:center;justify-content:space-between;padding:20px 24px 12px;flex-shrink:0;");
   const headLeft = el("div");
   const h1 = el("h1", "font-size:20px;font-weight:700;color:#1B1B1B;margin:0;letter-spacing:-0.4px;");
   h1.textContent = "Coordinator Dashboard";
   const sub = el("p", "font-size:12px;color:#8A8A8A;margin:2px 0 0;");
-  sub.textContent = `${coordinatorApplications.length} total application${coordinatorApplications.length === 1 ? "" : "s"}`;
+  sub.textContent = `${newCount} new listing${newCount === 1 ? "" : "s"} · ${appCount} application${appCount === 1 ? "" : "s"}`;
   headLeft.appendChild(h1);
   headLeft.appendChild(sub);
   const signOutBtn = el("button", "background:none;border:none;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;padding:0;");
@@ -1505,56 +1917,43 @@ function renderCoordinatorApp() {
   header.appendChild(signOutBtn);
   root.appendChild(header);
 
+  const tabRow = el("div", "display:flex;gap:8px;padding:0 24px 12px;flex-shrink:0;");
+  [["listings", newCount > 0 ? `Listings (${newCount} new)` : "Listings"], ["applications", "Applications"]].forEach(([id, label]) => {
+    const active = coordinatorTab === id;
+    const btn = el("button", `flex:1;padding:10px 0;border-radius:10px;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#1B1B1B"};font-size:13px;font-weight:600;cursor:pointer;`);
+    btn.textContent = label;
+    btn.addEventListener("click", () => { coordinatorTab = id; render(); });
+    tabRow.appendChild(btn);
+  });
+  root.appendChild(tabRow);
+
   const content = el("div", "flex:1;overflow-y:auto;padding:0 24px 20px;display:flex;flex-direction:column;gap:12px;");
 
-  if (coordinatorApplications.length === 0) {
-    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
-    empty.textContent = "No applications have come in yet.";
+  if (coordinatorAssignments.length === 0) {
+    const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;line-height:1.5;");
+    empty.textContent = "No company has assigned you yet. Once one does, their listings and applications will show up here.";
     content.appendChild(empty);
-  }
-
-  coordinatorApplications.forEach((app) => {
-    const s = app.student || {};
-    const p = app.posting || {};
-    const style = APPLICANT_STATUS_STYLES[app.status] || APPLICANT_STATUS_STYLES["Pending"];
-    const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
-
-    const topRow = el("div", "display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px;");
-    const nameH3 = el("h3", "font-size:14px;font-weight:600;color:#1B1B1B;margin:0;letter-spacing:-0.2px;");
-    nameH3.textContent = s.name || "(no name set)";
-    const statusChip = el("span", `font-size:10px;font-weight:600;color:${style.color};background:${style.bg};padding:3px 8px;border-radius:20px;flex-shrink:0;white-space:nowrap;`);
-    statusChip.textContent = app.status;
-    topRow.appendChild(nameH3);
-    topRow.appendChild(statusChip);
-    card.appendChild(topRow);
-
-    const roleP = el("p", "font-size:12px;color:#1B1B1B;margin:0 0 2px;font-weight:500;");
-    roleP.textContent = `${p.role || ""} · ${p.company || ""}`;
-    const progP = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 12px;");
-    progP.textContent = `${s.program || "No program set"} · ${s.year_level || "—"} Year`;
-    card.appendChild(roleP);
-    card.appendChild(progP);
-
-    if (s.resume_path) {
-      const resumeRow = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;margin-bottom:12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
-      resumeRow.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span>View Resume${s.resume_filename ? " — " + s.resume_filename : ""}</span>`;
-      resumeRow.addEventListener("click", () => viewResume(s.resume_path));
-      card.appendChild(resumeRow);
+  } else if (coordinatorTab === "listings") {
+    if (newCount > 0) {
+      const seenBtn = el("button", "padding:11px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:13px;font-weight:600;cursor:pointer;");
+      seenBtn.textContent = "Mark all as seen";
+      seenBtn.addEventListener("click", markListingsSeen);
+      content.appendChild(seenBtn);
     }
-
-    const actionsRow = el("div", "display:flex;gap:8px;");
-    const approveBtn = el("button", "flex:1;padding:9px 0;background:#E8F7F2;border:none;border-radius:10px;color:#1D9E75;font-size:12px;font-weight:600;cursor:pointer;");
-    approveBtn.textContent = "Approve";
-    approveBtn.addEventListener("click", () => setApplicationStatus(app.id, "Approved by Coordinator"));
-    const rejectBtn = el("button", "flex:1;padding:9px 0;background:#FFF0F0;border:none;border-radius:10px;color:#DC2626;font-size:12px;font-weight:600;cursor:pointer;");
-    rejectBtn.textContent = "Reject";
-    rejectBtn.addEventListener("click", () => setApplicationStatus(app.id, "Rejected"));
-    actionsRow.appendChild(approveBtn);
-    actionsRow.appendChild(rejectBtn);
-    card.appendChild(actionsRow);
-
-    content.appendChild(card);
-  });
+    if (coordinatorPostings.length === 0) {
+      const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
+      empty.textContent = "Your assigned companies haven't posted any listings yet.";
+      content.appendChild(empty);
+    }
+    coordinatorPostings.forEach((p) => content.appendChild(coordinatorListingCard(p)));
+  } else {
+    if (appCount === 0) {
+      const empty = el("p", "text-align:center;color:#ABABAB;font-size:13px;margin-top:60px;");
+      empty.textContent = "No applications have come in yet.";
+      content.appendChild(empty);
+    }
+    coordinatorApplications.forEach((app) => content.appendChild(coordinatorApplicationCard(app)));
+  }
 
   root.appendChild(content);
   return root;
@@ -2975,9 +3374,25 @@ function renderBottomNav() {
 // ---------------------------------------------------------
 contentEl.innerHTML = "";
 contentEl.appendChild(skeletonFeedScreen());
-sb.auth.signOut().finally(() => {
+async function initApp() {
+  if (isInviteLink) {
+    const { data } = await sb.auth.getSession();
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    if (data.session) {
+      state.settingPassword = true;
+      render();
+      return;
+    }
+    authState.error = "That invite link is invalid or has expired. Ask your company to resend it.";
+  } else if (inviteLinkError) {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    authState.error = inviteLinkError;
+  }
+  await sb.auth.signOut();
   studentId = null;
   companyId = null;
   state.session = null;
   render();
-});
+}
+
+initApp();
