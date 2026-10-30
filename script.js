@@ -14,6 +14,906 @@ let POSTINGS = [];
 let studentId = null;   // == auth user id, when logged in as a student
 let companyId = null;   // == auth user id, when logged in as a company
 
+// ---------------------------------------------------------
+// Resume verification (calls the verify-resume Edge Function)
+// ---------------------------------------------------------
+const resumeChecks = {}; // storage path -> { status, score, reasons }
+
+// A real PDF carries the "%PDF-" signature near the start. file.type alone can be faked by renaming.
+async function hasPdfSignature(file) {
+  const head = await file.slice(0, 1024).text();
+  return head.includes("%PDF-");
+}
+
+async function verifyResume(path) {
+  try {
+    const { data, error } = await sb.functions.invoke("verify-resume", { body: { path } });
+    if (error || !data || !data.status) throw new Error("no result");
+    resumeChecks[path] = { status: data.status, score: data.score, reasons: data.reasons || [], skills: data.skills_found || [] };
+  } catch (e) {
+    // The check service is unreachable: keep the upload but flag it for a human to review.
+    resumeChecks[path] = { status: "needs_review", score: null, reasons: ["Automatic check unavailable."], skills: [] };
+  }
+  return resumeChecks[path];
+}
+
+async function loadResumeChecks(paths) {
+  const unique = [...new Set((paths || []).filter(Boolean))];
+  if (unique.length === 0) return;
+  const { data } = await sb.from("resume_checks").select("path, status, score, reasons, details").in("path", unique);
+  (data || []).forEach((r) => {
+    resumeChecks[r.path] = { status: r.status, score: r.score, reasons: r.reasons || [], skills: (r.details && r.details.skills_found) || [] };
+  });
+}
+
+const RESUME_BADGE_STYLES = {
+  verified: { bg: "#E8F7F2", color: "#1D9E75", text: "Verified resume" },
+  needs_review: { bg: "#FFF6E0", color: "#D98A00", text: "Needs manual review" },
+  rejected: { bg: "#FFF0F0", color: "#DC2626", text: "Not recognized as a resume" },
+};
+
+function resumeBadge(path, showReasons) {
+  const chk = path && resumeChecks[path];
+  if (!chk) return null;
+  const st = RESUME_BADGE_STYLES[chk.status] || RESUME_BADGE_STYLES.needs_review;
+  const wrap = el("div", "display:flex;flex-direction:column;gap:3px;margin-top:6px;");
+  const chip = el("span", `align-self:flex-start;font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;color:${st.color};background:${st.bg};`);
+  chip.textContent = chk.score == null ? st.text : `${st.text} (${chk.score}/100)`;
+  wrap.appendChild(chip);
+  if (showReasons && chk.status !== "verified" && chk.reasons.length) {
+    const why = el("p", "font-size:11px;color:#8A8A8A;margin:0;line-height:1.4;");
+    why.textContent = chk.reasons.slice(0, 2).join(" ");
+    wrap.appendChild(why);
+  }
+  return wrap;
+}
+
+// =========================================================
+// v2 features: skill proof (quiz / certificate), skills star rating,
+// near-me jobs, company fit preferences, work conditions & dress code.
+// The TF-IDF fit % is NOT changed by any of this; these are separate,
+// explainable signals shown beside it.
+// =========================================================
+const normSkill = (s) => String(s || "").toLowerCase().trim();
+const parseList = (text) => String(text || "").split(",").map((t) => t.trim()).filter(Boolean);
+
+const WORK_SETUPS = ["Onsite", "Hybrid", "Remote"];
+const YEAR_LEVEL_OPTIONS = ["1st", "2nd", "3rd", "4th"];
+const DRESS_CODES = [
+  "No specific requirement",
+  "Company uniform provided",
+  "Company shirt / ID provided",
+  "Business formal",
+  "Business casual",
+  "Smart casual",
+  "Civilian clothes (no uniform)",
+  "School uniform",
+];
+// Job-related conditions only. Nothing here is about gender, age, religion or appearance.
+const PHYSICAL_DEMANDS = [
+  "Mostly desk-based",
+  "Long periods of standing",
+  "Frequent walking or field visits",
+  "Lifting or carrying (state weight in notes)",
+  "Outdoor, hot or noisy environment",
+  "Night or rotating shifts",
+  "Travel required",
+];
+const SORT_MODES = [["fit", "Best fit"], ["stars", "Top skills"], ["nearest", "Nearest"], ["overall", "Best overall"]];
+const SORT_LABELS = { fit: "fit", stars: "skills rating", nearest: "distance", overall: "overall match" };
+const QUIZ_PASS_PERCENT = 70;
+
+let skillProofs = {};      // my proofs:        { skill: { quiz, certificate } }
+let applicantProofs = {};  // applicants' proofs: { studentId: { skill: { quiz, certificate } } }
+
+// ---------------------------------------------------------
+// Pure helpers (no DOM) - covered by the unit tests
+// ---------------------------------------------------------
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function formatDistance(km) {
+  if (km == null) return "";
+  return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+}
+
+// Strength of evidence for ONE skill. Quiz (graded on the server) is strongest.
+const EVIDENCE_WEIGHTS = { quiz: 1.0, certificate: 0.8, resume: 0.6, profile: 0.5, none: 0 };
+
+function skillEvidence(skill, ctx) {
+  const k = normSkill(skill);
+  const proofs = (ctx.proofs && ctx.proofs[k]) || {};
+  if (proofs.quiz && proofs.quiz.status === "verified") {
+    return { tier: "quiz", weight: EVIDENCE_WEIGHTS.quiz, detail: proofs.quiz.score != null ? `Quiz ${proofs.quiz.score}%` : "Quiz passed" };
+  }
+  if (proofs.certificate && (proofs.certificate.status === "needs_review" || proofs.certificate.status === "verified")) {
+    return { tier: "certificate", weight: EVIDENCE_WEIGHTS.certificate, detail: "Certificate" };
+  }
+  if ((ctx.resumeSkills || []).some((s) => normSkill(s) === k)) {
+    return { tier: "resume", weight: EVIDENCE_WEIGHTS.resume, detail: "In resume" };
+  }
+  if ((ctx.skills || []).some((s) => normSkill(s) === k)) {
+    return { tier: "profile", weight: EVIDENCE_WEIGHTS.profile, detail: "Listed" };
+  }
+  return { tier: "none", weight: 0, detail: "Not shown yet" };
+}
+
+// Stars (0-5, in half steps) = average evidence strength across the posting's required skills.
+function skillStars(requiredSkills, ctx) {
+  const req = (requiredSkills || []).filter(Boolean);
+  if (req.length === 0) return null;
+  const rows = req.map((skill) => ({ skill, ...skillEvidence(skill, ctx) }));
+  const avg = rows.reduce((sum, r) => sum + r.weight, 0) / rows.length;
+  return {
+    stars: Math.round(avg * 5 * 2) / 2,
+    rows,
+    total: rows.length,
+    covered: rows.filter((r) => r.tier !== "none").length,
+    verified: rows.filter((r) => r.tier === "quiz" || r.tier === "certificate").length,
+  };
+}
+
+function starsText(stars) {
+  const n = Math.max(0, Math.min(5, Math.round(stars)));
+  return "\u2605".repeat(n) + "\u2606".repeat(5 - n);
+}
+
+// Company-set preferences (program, year level, work setup) vs. the student's own.
+function preferenceMatch(posting, prefs) {
+  const checks = [];
+  const includesLoose = (list, value) => {
+    const v = normSkill(value);
+    return v !== "" && list.some((x) => { const n = normSkill(x); return n === v || v.includes(n) || n.includes(v); });
+  };
+  if ((posting.preferredPrograms || []).length) {
+    checks.push({ key: "program", label: "Program", ok: includesLoose(posting.preferredPrograms, prefs.program) });
+  }
+  if ((posting.preferredYearLevels || []).length) {
+    checks.push({ key: "year", label: "Year level", ok: includesLoose(posting.preferredYearLevels, prefs.yearLevel) });
+  }
+  if (posting.workSetup && (prefs.workSetupPref || []).length) {
+    checks.push({ key: "setup", label: `Work setup (${posting.workSetup})`, ok: prefs.workSetupPref.includes(posting.workSetup) });
+  }
+  if (prefs.maxDistanceKm && prefs.distanceKm != null && posting.workSetup !== "Remote") {
+    checks.push({ key: "distance", label: `Within ${prefs.maxDistanceKm} km`, ok: prefs.distanceKm <= prefs.maxDistanceKm });
+  }
+  const matched = checks.filter((c) => c.ok).length;
+  return { checks, matched, total: checks.length, pct: checks.length ? Math.round((100 * matched) / checks.length) : null };
+}
+
+// Optional combined ranking: 50% fit, 30% skills rating, 20% preferences (missing parts are skipped).
+function overallScore(fit, stars, prefPct) {
+  const parts = [[0.5, fit]];
+  if (stars != null) parts.push([0.3, (stars / 5) * 100]);
+  if (prefPct != null) parts.push([0.2, prefPct]);
+  const w = parts.reduce((s, p) => s + p[0], 0);
+  return parts.reduce((s, p) => s + p[0] * p[1], 0) / w;
+}
+
+function postingHasConditions(p) {
+  return !!((p.dressCode && p.dressCode !== "No specific requirement") ||
+    (p.physicalDemands && p.physicalDemands.length) || p.dressNotes || p.physicalNotes);
+}
+
+// ---------------------------------------------------------
+// Context builders and per-posting numbers
+// ---------------------------------------------------------
+function myEvidenceCtx() {
+  const chk = resumeChecks[profileState.resumePath] || {};
+  return { skills: profileState.skills, proofs: skillProofs, resumeSkills: chk.skills || [] };
+}
+
+function applicantCtx(student) {
+  const chk = resumeChecks[student.resume_path] || {};
+  return { skills: student.skills || [], proofs: applicantProofs[student.id] || {}, resumeSkills: chk.skills || [] };
+}
+
+function postingDistanceKm(posting) {
+  if (!state.myLoc || posting.lat == null || posting.lng == null) return null;
+  return haversineKm(state.myLoc.lat, state.myLoc.lng, posting.lat, posting.lng);
+}
+
+function myPrefs(posting) {
+  return {
+    program: profileState.program,
+    yearLevel: profileState.yearLevel,
+    workSetupPref: profileState.workSetupPref,
+    maxDistanceKm: profileState.maxDistanceKm,
+    distanceKm: postingDistanceKm(posting),
+  };
+}
+
+function passesRadius(posting) {
+  if (!state.radiusKm || !state.myLoc) return true;
+  if (posting.workSetup === "Remote") return true;
+  const d = postingDistanceKm(posting);
+  return d == null || d <= state.radiusKm;   // unknown coordinates are kept, not hidden
+}
+
+function postingComparator() {
+  const fit = (p) => getFitScore(p.id);
+  const stars = (p) => { const r = skillStars(p.tags, myEvidenceCtx()); return r ? r.stars : -1; };
+  const overall = (p) => {
+    const r = skillStars(p.tags, myEvidenceCtx());
+    return overallScore(fit(p), r ? r.stars : null, preferenceMatch(p, myPrefs(p)).pct);
+  };
+  const dist = (p) => { const d = postingDistanceKm(p); return d == null ? Infinity : d; };
+  switch (state.sortMode) {
+    case "stars": return (a, b) => stars(b) - stars(a) || fit(b) - fit(a);
+    case "nearest": return (a, b) => dist(a) - dist(b) || fit(b) - fit(a);
+    case "overall": return (a, b) => overall(b) - overall(a);
+    default: return (a, b) => fit(b) - fit(a);
+  }
+}
+
+// ---------------------------------------------------------
+// Data: proofs, quiz service, certificates, location
+// ---------------------------------------------------------
+async function loadSkillProofsFor(studentIds) {
+  const ids = [...new Set((studentIds || []).filter(Boolean))];
+  const out = {};
+  if (ids.length === 0) return out;
+  const { data } = await sb.from("skill_proofs")
+    .select("student_id, skill, method, status, score, certificate_name, certificate_path, attempts, last_attempt_at")
+    .in("student_id", ids);
+  (data || []).forEach((r) => {
+    if (!out[r.student_id]) out[r.student_id] = {};
+    if (!out[r.student_id][r.skill]) out[r.student_id][r.skill] = {};
+    out[r.student_id][r.skill][r.method] = r;
+  });
+  return out;
+}
+
+async function loadMySkillProofs() {
+  const all = await loadSkillProofsFor([studentId]);
+  skillProofs = all[studentId] || {};
+}
+
+async function loadApplicantProofs(studentIds) {
+  const all = await loadSkillProofsFor(studentIds);
+  applicantProofs = { ...applicantProofs, ...all };
+}
+
+async function callSkillQuiz(body) {
+  const { data, error } = await sb.functions.invoke("skill-quiz", { body });
+  if (!error) return { data };
+  let message = error.message;
+  try {
+    const b = await error.context.json();
+    if (b && b.error) message = b.error;
+  } catch (e) {}
+  return { error: message };
+}
+
+async function loadQuizSkills() {
+  const r = await callSkillQuiz({ action: "list" });
+  state.quizSkills = new Set(((r.data && r.data.skills) || []).map(normSkill));
+}
+
+async function startSkillQuiz(skill) {
+  state.skillQuiz = { skill, questions: [], index: 0, answers: {}, result: null, busy: true, error: "" };
+  render();
+  const r = await callSkillQuiz({ action: "start", skill });
+  const sq = state.skillQuiz;
+  if (!sq) return;
+  sq.busy = false;
+  if (r.error) sq.error = r.error;
+  else sq.questions = r.data.questions || [];
+  render();
+}
+
+async function submitSkillQuiz() {
+  const sq = state.skillQuiz;
+  if (!sq || sq.busy) return;
+  sq.busy = true;
+  render();
+  const answers = sq.questions.map((q) => ({ id: q.id, choice: sq.answers[q.id] }));
+  const r = await callSkillQuiz({ action: "submit", skill: sq.skill, answers });
+  sq.busy = false;
+  if (r.error) sq.error = r.error;
+  else {
+    sq.result = r.data;
+    await loadMySkillProofs();
+  }
+  render();
+}
+
+async function uploadCertificate(skill, file) {
+  if (!studentId || !file) return;
+  if (file.type !== "application/pdf" || !(await hasPdfSignature(file))) {
+    alert("Please upload a PDF certificate.");
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    alert("The certificate is larger than 5 MB.");
+    return;
+  }
+  state.certBusy = normSkill(skill);
+  render();
+  const safeName = file.name.replace(/[^\w.\-]+/g, "_");
+  const slug = normSkill(skill).replace(/[^a-z0-9]+/g, "-");
+  const path = `${studentId}/${Date.now()}-${slug}-${safeName}`;
+  const { error: upErr } = await sb.storage.from("certificates").upload(path, file, { upsert: false, contentType: "application/pdf" });
+  if (upErr) {
+    state.certBusy = "";
+    alert("Certificate upload failed: " + upErr.message);
+    render();
+    return;
+  }
+  const { data, error } = await sb.functions.invoke("verify-certificate", { body: { path, skill: normSkill(skill), filename: file.name } });
+  state.certBusy = "";
+  if (error || !data) {
+    alert("The certificate was uploaded but could not be checked right now. Please try again later.");
+  } else if (data.status === "rejected") {
+    alert("This file doesn't look like a certificate. " + ((data.reasons && data.reasons[0]) || ""));
+  } else if (data.status === "unmatched") {
+    alert("This looks like a certificate, but it doesn't mention \"" + skill + "\", so it won't count for this skill.");
+  }
+  await loadMySkillProofs();
+  render();
+}
+
+async function openCertificate(path) {
+  if (!path) return;
+  const { data, error } = await sb.storage.from("certificates").createSignedUrl(path, 60);
+  if (error || !data) { alert("Could not open the certificate."); return; }
+  window.open(data.signedUrl, "_blank");
+}
+
+// Optional: turn the company's typed location into coordinates (OpenStreetMap Nominatim).
+// Usage policy: low volume only (max 1 request/second). Fine for posting saves; do not call in a loop.
+async function geocodeLocation(text) {
+  try {
+    const q = String(text || "").replace(/\u00b7.*$/, "").trim();   // drop "· On-site" style suffixes
+    if (!q) return null;
+    const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=ph&q=" + encodeURIComponent(q);
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (!rows.length) return null;
+    return { lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon) };
+  } catch (e) {
+    return null;
+  }
+}
+
+// The student's location stays in memory only; it is never stored.
+function requestMyLocation() {
+  if (!navigator.geolocation) { alert("Your browser doesn't support location."); return; }
+  state.locStatus = "locating";
+  render();
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      state.myLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      state.locStatus = "";
+      state.sortMode = "nearest";
+      render();
+    },
+    () => {
+      state.locStatus = "";
+      alert("Couldn't get your location. Allow location access in your browser to see jobs near you.");
+      render();
+    },
+    { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
+  );
+}
+
+// ---------------------------------------------------------
+// Small UI helpers
+// ---------------------------------------------------------
+const TIER_STYLES = {
+  quiz: { bg: "#E8F7F2", color: "#1D9E75", icon: "\u2713 " },
+  certificate: { bg: "#EFF6FF", color: "#2563EB", icon: "\uD83D\uDCC4 " },
+  resume: { bg: "#FFF8E6", color: "#D98A00", icon: "" },
+  profile: { bg: "#F4F4F4", color: "#6A6A6A", icon: "" },
+  none: { bg: "#FFF0F0", color: "#DC2626", icon: "" },
+};
+
+function evidenceChip(tier, detail) {
+  const st = TIER_STYLES[tier] || TIER_STYLES.none;
+  const chip = el("span", `font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;background:${st.bg};color:${st.color};white-space:nowrap;`);
+  chip.textContent = st.icon + detail;
+  return chip;
+}
+
+function sectionCard(title) {
+  const card = el("div", "background:#FFFFFF;border-radius:16px;padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+  const h = el("h3", "margin:0 0 12px;font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;");
+  h.textContent = title;
+  card.appendChild(h);
+  return card;
+}
+
+// A chip that toggles itself in place (no re-render, so the form keeps its scroll position).
+function toggleChip(label, active, onToggle) {
+  const paint = (btn, on) => {
+    btn.style.background = on ? "#1D9E75" : "#FFFFFF";
+    btn.style.color = on ? "#FFFFFF" : "#6A6A6A";
+    btn.style.border = on ? "1.5px solid #1D9E75" : "1.5px solid #E8E8E8";
+  };
+  const btn = el("button", "padding:6px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;");
+  btn.type = "button";
+  btn.textContent = label;
+  let on = !!active;
+  paint(btn, on);
+  btn.addEventListener("click", () => { on = !on; paint(btn, on); onToggle(on); });
+  return btn;
+}
+
+function smallButton(label, onClick, disabled) {
+  const b = el("button", "padding:5px 10px;border-radius:8px;border:1.5px solid #E8E8E8;background:#FFFFFF;color:#1D9E75;font-size:11px;font-weight:600;cursor:pointer;");
+  b.type = "button";
+  b.textContent = label;
+  b.disabled = !!disabled;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+// Quiz / certificate buttons for one skill (student side).
+function proofActions(skill) {
+  const k = normSkill(skill);
+  const row = el("div", "display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;");
+  const proofs = skillProofs[k] || {};
+  if (state.quizSkills.has(k) && !(proofs.quiz && proofs.quiz.status === "verified")) {
+    row.appendChild(smallButton("Take quiz", () => startSkillQuiz(k)));
+  }
+  if (!(proofs.certificate && proofs.certificate.status === "needs_review")) {
+    const busy = state.certBusy === k;
+    const lab = el("label", "padding:5px 10px;border-radius:8px;border:1.5px solid #E8E8E8;background:#FFFFFF;color:#2563EB;font-size:11px;font-weight:600;cursor:pointer;");
+    lab.textContent = busy ? "Checking\u2026" : "Add certificate (PDF)";
+    const input = el("input", "display:none;", { type: "file", accept: "application/pdf" });
+    input.addEventListener("change", (e) => { if (e.target.files[0]) uploadCertificate(skill, e.target.files[0]); });
+    lab.appendChild(input);
+    row.appendChild(lab);
+  }
+  return row;
+}
+
+// Compact signals under a posting card: stars, distance, work setup, preference match.
+function postingSignalsRow(posting) {
+  const row = el("div", "display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px;font-size:11px;");
+  const sr = skillStars(posting.tags, myEvidenceCtx());
+  if (sr) {
+    const s = el("span", "color:#F5A623;font-weight:600;");
+    s.textContent = `${starsText(sr.stars)} ${sr.stars.toFixed(1)}`;
+    s.title = `${sr.covered} of ${sr.total} required skills shown, ${sr.verified} verified`;
+    row.appendChild(s);
+  }
+  const chipStyle = "background:#F4F4F4;color:#6A6A6A;padding:2px 8px;border-radius:20px;";
+  const d = postingDistanceKm(posting);
+  if (d != null) { const c = el("span", chipStyle); c.textContent = "\uD83D\uDCCD " + formatDistance(d); row.appendChild(c); }
+  if (posting.workSetup) { const c = el("span", chipStyle); c.textContent = posting.workSetup; row.appendChild(c); }
+  const pm = preferenceMatch(posting, myPrefs(posting));
+  if (pm.total) {
+    const c = el("span", `background:${pm.matched === pm.total ? "#E8F7F2" : "#FFF8E6"};color:${pm.matched === pm.total ? "#1D9E75" : "#D98A00"};padding:2px 8px;border-radius:20px;`);
+    c.textContent = `Preferences ${pm.matched}/${pm.total}`;
+    row.appendChild(c);
+  }
+  return row.children.length ? row : null;
+}
+
+// ---------------------------------------------------------
+// Student screens / cards
+// ---------------------------------------------------------
+function renderSkillsMatchCard(posting) {
+  const res = skillStars(posting.tags, myEvidenceCtx());
+  if (!res) return null;
+  const card = sectionCard("Your Skills Match");
+  const top = el("div", "display:flex;align-items:baseline;gap:8px;margin-bottom:4px;");
+  const stars = el("span", "color:#F5A623;font-size:20px;letter-spacing:1px;");
+  stars.textContent = starsText(res.stars);
+  const num = el("span", "font-size:13px;font-weight:600;color:#1B1B1B;");
+  num.textContent = `${res.stars.toFixed(1)} / 5`;
+  top.appendChild(stars);
+  top.appendChild(num);
+  card.appendChild(top);
+  const note = el("p", "margin:0 0 12px;font-size:12px;color:#8A8A8A;line-height:1.5;");
+  note.textContent = `${res.covered} of ${res.total} required skills shown, ${res.verified} verified by a quiz or certificate. Stars come from your skills, resume, quizzes and certificates, and are separate from the fit %.`;
+  card.appendChild(note);
+  res.rows.forEach((r) => {
+    const item = el("div", "padding:8px 0;border-top:1px solid #F4F4F4;");
+    const line = el("div", "display:flex;align-items:center;justify-content:space-between;gap:8px;");
+    const name = el("span", "font-size:13px;font-weight:500;color:#1B1B1B;");
+    name.textContent = r.skill;
+    line.appendChild(name);
+    line.appendChild(evidenceChip(r.tier, r.detail));
+    item.appendChild(line);
+    if (r.tier !== "quiz") item.appendChild(proofActions(r.skill));
+    card.appendChild(item);
+  });
+  return card;
+}
+
+function renderPreferenceMatchCard(posting) {
+  const pm = preferenceMatch(posting, myPrefs(posting));
+  if (!pm.total) return null;
+  const card = sectionCard("Fit Preferences");
+  const row = el("div", "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;");
+  pm.checks.forEach((c) => {
+    const chip = el("span", `font-size:12px;font-weight:600;padding:4px 10px;border-radius:20px;background:${c.ok ? "#E8F7F2" : "#FFF0F0"};color:${c.ok ? "#1D9E75" : "#DC2626"};`);
+    chip.textContent = (c.ok ? "\u2713 " : "\u2717 ") + c.label;
+    row.appendChild(chip);
+  });
+  card.appendChild(row);
+  const note = el("p", "margin:0;font-size:12px;color:#8A8A8A;line-height:1.5;");
+  note.textContent = "These compare what the company prefers with your profile. They don't change your fit % and don't stop you from applying.";
+  card.appendChild(note);
+  return card;
+}
+
+function renderConditionsCard(posting) {
+  if (!postingHasConditions(posting)) return null;
+  const card = sectionCard("Work Conditions & Dress Code");
+  const addLine = (label, value) => {
+    if (!value) return;
+    const p = el("p", "margin:0 0 8px;font-size:13px;color:#3A3A3A;line-height:1.5;");
+    const b = el("strong"); b.textContent = label + ": ";
+    p.appendChild(b);
+    p.appendChild(document.createTextNode(value));
+    card.appendChild(p);
+  };
+  if (posting.dressCode && posting.dressCode !== "No specific requirement") addLine("Dress code", posting.dressCode);
+  addLine("Dress code notes", posting.dressNotes);
+  if (posting.physicalDemands.length) {
+    const row = el("div", "display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px;");
+    posting.physicalDemands.forEach((d) => {
+      const c = el("span", "background:#F4F4F4;color:#1B1B1B;font-size:12px;padding:4px 10px;border-radius:20px;");
+      c.textContent = d;
+      row.appendChild(c);
+    });
+    card.appendChild(row);
+  }
+  addLine("Physical requirements notes", posting.physicalNotes);
+  const note = el("p", "margin:4px 0 0;font-size:12px;color:#8A8A8A;line-height:1.5;");
+  note.textContent = "If you need an accommodation, contact the company before applying.";
+  card.appendChild(note);
+  return card;
+}
+
+function renderAckCard() {
+  const card = el("div", "background:#FFFFFF;border-radius:16px;padding:14px 16px;margin-top:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);");
+  const lab = el("label", "display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;color:#1B1B1B;line-height:1.5;");
+  const cb = el("input", "margin-top:3px;", { type: "checkbox", checked: applyFormState.ack });
+  cb.addEventListener("change", (e) => { applyFormState.ack = e.target.checked; render(); });
+  lab.appendChild(cb);
+  const t = el("span");
+  t.textContent = "I have read the work conditions and dress code, and I can follow them or will contact the company about accommodations.";
+  lab.appendChild(t);
+  card.appendChild(lab);
+  return card;
+}
+
+function renderSkillProofsCard() {
+  const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
+  const label = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 4px;");
+  label.textContent = "Skill Proof";
+  card.appendChild(label);
+  const note = el("p", "font-size:12px;color:#8A8A8A;margin:0 0 10px;line-height:1.5;");
+  note.textContent = "Pass a short quiz or add a PDF certificate to earn a stronger skills rating on postings.";
+  card.appendChild(note);
+  if (profileState.skills.length === 0) {
+    const empty = el("p", "font-size:12px;color:#ABABAB;margin:0;");
+    empty.textContent = "Add skills above to see them here.";
+    card.appendChild(empty);
+    return card;
+  }
+  const ctx = myEvidenceCtx();
+  profileState.skills.forEach((skill) => {
+    const ev = skillEvidence(skill, ctx);
+    const item = el("div", "padding:8px 0;border-top:1px solid #F4F4F4;");
+    const line = el("div", "display:flex;align-items:center;justify-content:space-between;gap:8px;");
+    const name = el("span", "font-size:13px;font-weight:500;color:#1B1B1B;");
+    name.textContent = skill;
+    line.appendChild(name);
+    line.appendChild(evidenceChip(ev.tier, ev.detail));
+    item.appendChild(line);
+    if (ev.tier !== "quiz") item.appendChild(proofActions(skill));
+    card.appendChild(item);
+  });
+  return card;
+}
+
+function renderPreferencesCard() {
+  const card = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
+  const label = el("p", "font-size:12px;font-weight:600;color:#8A8A8A;text-transform:uppercase;letter-spacing:0.5px;margin:0 0 10px;");
+  label.textContent = "My Preferences";
+  card.appendChild(label);
+
+  const setupLabel = el("p", "font-size:12px;color:#6A6A6A;margin:0 0 6px;");
+  setupLabel.textContent = "Preferred work setup";
+  card.appendChild(setupLabel);
+  const setupRow = el("div", "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;");
+  WORK_SETUPS.forEach((w) => {
+    setupRow.appendChild(toggleChip(w, profileState.workSetupPref.includes(w), (on) => {
+      profileState.workSetupPref = on ? [...profileState.workSetupPref, w] : profileState.workSetupPref.filter((x) => x !== w);
+      profileState.saved = false;
+    }));
+  });
+  card.appendChild(setupRow);
+
+  const distLabel = el("p", "font-size:12px;color:#6A6A6A;margin:0 0 6px;");
+  distLabel.textContent = "Farthest I'm willing to travel";
+  card.appendChild(distLabel);
+  const select = el("select", inputStyleText());
+  [[0, "No limit"], [5, "5 km"], [10, "10 km"], [25, "25 km"], [50, "50 km"], [100, "100 km"]].forEach(([v, text]) => {
+    const opt = el("option", "", { value: String(v), textContent: text });
+    if (Number(profileState.maxDistanceKm || 0) === v) opt.selected = true;
+    select.appendChild(opt);
+  });
+  select.addEventListener("change", (e) => { profileState.maxDistanceKm = Number(e.target.value) || 0; profileState.saved = false; });
+  card.appendChild(select);
+  const hint = el("p", "font-size:11px;color:#ABABAB;margin:8px 0 0;line-height:1.5;");
+  hint.textContent = "Distances use your current location only when you tap \"Near me\" on the home screen. It isn't saved.";
+  card.appendChild(hint);
+  return card;
+}
+
+function renderSkillQuizScreen() {
+  const sq = state.skillQuiz;
+  const root = el("div", "display:flex;flex-direction:column;height:100%;background:#FAFAFA;");
+  const header = el("div", "display:flex;align-items:center;gap:12px;padding:16px 24px 12px;flex-shrink:0;");
+  const back = el("button", "width:36px;height:36px;border-radius:10px;background:#F0F0F0;border:none;cursor:pointer;font-size:16px;");
+  back.textContent = "\u2190";
+  back.addEventListener("click", () => { state.skillQuiz = null; render(); });
+  const title = el("span", "font-size:15px;font-weight:600;color:#1B1B1B;");
+  title.textContent = `Skill quiz: ${sq.skill}`;
+  header.appendChild(back);
+  header.appendChild(title);
+  root.appendChild(header);
+
+  const body = el("div", "flex:1;overflow-y:auto;padding:8px 24px 24px;");
+
+  if (sq.busy) {
+    const p = el("p", "font-size:14px;color:#8A8A8A;");
+    p.textContent = sq.result ? "Saving\u2026" : "Loading\u2026";
+    body.appendChild(p);
+  } else if (sq.error) {
+    const p = el("p", "font-size:14px;color:#DC2626;line-height:1.5;");
+    p.textContent = sq.error;
+    body.appendChild(p);
+  } else if (sq.result) {
+    const r = sq.result;
+    const card = sectionCard(r.passed ? "Quiz passed" : "Not passed yet");
+    const big = el("p", `font-size:32px;font-weight:700;margin:0 0 6px;color:${r.passed ? "#1D9E75" : "#DC2626"};`);
+    big.textContent = `${r.score}%`;
+    card.appendChild(big);
+    const msg = el("p", "font-size:13px;color:#6A6A6A;margin:0;line-height:1.5;");
+    msg.textContent = r.passed
+      ? `${r.correct} of ${r.total} correct. This skill now counts as verified on your postings.`
+      : `${r.correct} of ${r.total} correct. You need ${QUIZ_PASS_PERCENT}% to pass. You can try again after a short wait.`;
+    card.appendChild(msg);
+    body.appendChild(card);
+    const done = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;");
+    done.textContent = "Done";
+    done.addEventListener("click", () => { state.skillQuiz = null; render(); });
+    body.appendChild(done);
+  } else if (sq.questions.length) {
+    const q = sq.questions[sq.index];
+    const prog = el("p", "font-size:12px;color:#ABABAB;margin:0 0 8px;");
+    prog.textContent = `Question ${sq.index + 1} of ${sq.questions.length}`;
+    body.appendChild(prog);
+    const qText = el("h2", "font-size:17px;font-weight:600;color:#1B1B1B;margin:0 0 16px;line-height:1.4;");
+    qText.textContent = q.question;
+    body.appendChild(qText);
+    q.options.forEach((opt, i) => {
+      const chosen = sq.answers[q.id] === i;
+      const b = el("button", `display:block;width:100%;text-align:left;padding:13px 14px;margin-bottom:10px;border-radius:12px;font-size:14px;cursor:pointer;border:1.5px solid ${chosen ? "#1D9E75" : "#E8E8E8"};background:${chosen ? "#E8F7F2" : "#FFFFFF"};color:#1B1B1B;`);
+      b.textContent = opt;
+      b.addEventListener("click", () => { sq.answers[q.id] = i; render(); });
+      body.appendChild(b);
+    });
+    const last = sq.index === sq.questions.length - 1;
+    const next = el("button", "width:100%;padding:14px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;margin-top:6px;");
+    next.textContent = last ? "Submit" : "Next";
+    next.disabled = sq.answers[q.id] === undefined;
+    next.style.opacity = next.disabled ? "0.5" : "1";
+    next.addEventListener("click", () => { if (last) submitSkillQuiz(); else { sq.index += 1; render(); } });
+    body.appendChild(next);
+  } else {
+    const p = el("p", "font-size:14px;color:#8A8A8A;");
+    p.textContent = "No questions are available for this skill yet.";
+    body.appendChild(p);
+  }
+  root.appendChild(body);
+  return root;
+}
+
+// ---------------------------------------------------------
+// Home screen controls: sort chips, "Near me", radius
+// ---------------------------------------------------------
+function renderSortControls() {
+  const wrap = el("div", "margin-top:12px;");
+  const row = el("div", "display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;");
+  SORT_MODES.forEach(([mode, text]) => {
+    const active = state.sortMode === mode;
+    const b = el("button", `flex-shrink:0;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;border:${active ? "none" : "1.5px solid #E8E8E8"};background:${active ? "#1D9E75" : "#FFFFFF"};color:${active ? "#FFFFFF" : "#6A6A6A"};`);
+    b.textContent = text;
+    b.addEventListener("click", () => {
+      if (mode === "nearest" && !state.myLoc) { requestMyLocation(); return; }
+      state.sortMode = mode;
+      render();
+    });
+    row.appendChild(b);
+  });
+  wrap.appendChild(row);
+
+  const line = el("div", "display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap;");
+  const near = el("button", `padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;border:1.5px solid #1D9E75;background:${state.myLoc ? "#E8F7F2" : "#FFFFFF"};color:#1D9E75;`);
+  near.textContent = state.locStatus === "locating" ? "Finding you\u2026" : state.myLoc ? "\uD83D\uDCCD Near me: on" : "\uD83D\uDCCD Near me";
+  near.addEventListener("click", () => {
+    if (state.myLoc) { state.myLoc = null; state.radiusKm = 0; if (state.sortMode === "nearest") state.sortMode = "fit"; render(); }
+    else requestMyLocation();
+  });
+  line.appendChild(near);
+  if (state.myLoc) {
+    const sel = el("select", "padding:6px 8px;border-radius:20px;border:1.5px solid #E8E8E8;background:#FFFFFF;font-size:12px;color:#6A6A6A;");
+    [[0, "Any distance"], [5, "Within 5 km"], [10, "Within 10 km"], [25, "Within 25 km"], [50, "Within 50 km"]].forEach(([v, text]) => {
+      const opt = el("option", "", { value: String(v), textContent: text });
+      if (state.radiusKm === v) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener("change", (e) => { state.radiusKm = Number(e.target.value) || 0; render(); });
+    line.appendChild(sel);
+    const priv = el("span", "font-size:11px;color:#ABABAB;");
+    priv.textContent = "Location isn't saved";
+    line.appendChild(priv);
+  }
+  wrap.appendChild(line);
+  return wrap;
+}
+
+// ---------------------------------------------------------
+// Company and coordinator: skill evidence for an applicant
+// ---------------------------------------------------------
+function applicantEvidenceBlock(student, requiredSkills) {
+  const res = skillStars(requiredSkills, applicantCtx(student));
+  if (!res) return null;
+  const wrap = el("div", "margin-bottom:12px;");
+  const top = el("div", "display:flex;align-items:baseline;gap:8px;margin-bottom:6px;");
+  const stars = el("span", "color:#F5A623;font-size:16px;letter-spacing:1px;");
+  stars.textContent = starsText(res.stars);
+  const num = el("span", "font-size:12px;font-weight:600;color:#1B1B1B;");
+  num.textContent = `${res.stars.toFixed(1)} / 5 skills match`;
+  top.appendChild(stars);
+  top.appendChild(num);
+  wrap.appendChild(top);
+  const row = el("div", "display:flex;flex-wrap:wrap;gap:5px;");
+  const proofs = applicantProofs[student.id] || {};
+  res.rows.forEach((r) => {
+    const chip = evidenceChip(r.tier, `${r.skill}: ${r.detail}`);
+    const cert = proofs[normSkill(r.skill)] && proofs[normSkill(r.skill)].certificate;
+    if (r.tier === "certificate" && cert && cert.certificate_path) {
+      chip.style.cursor = "pointer";
+      chip.title = "Open certificate";
+      chip.addEventListener("click", () => openCertificate(cert.certificate_path));
+    }
+    row.appendChild(chip);
+  });
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function applicantRequiredSkills() {
+  const p = companyListings.find((x) => x.id === applicantsForPostingId);
+  return p ? p.tags : [];
+}
+
+// ---------------------------------------------------------
+// Company posting form: fit preferences and work conditions
+// ---------------------------------------------------------
+function appendPostingExtras(wrap) {
+  const heading = (text, sub) => {
+    const h = el("div", "margin-top:6px;");
+    const t = el("p", "margin:0;font-size:14px;font-weight:700;color:#1B1B1B;");
+    t.textContent = text;
+    h.appendChild(t);
+    if (sub) {
+      const s = el("p", "margin:2px 0 0;font-size:12px;color:#8A8A8A;line-height:1.5;");
+      s.textContent = sub;
+      h.appendChild(s);
+    }
+    return h;
+  };
+
+  wrap.appendChild(heading("Fit preferences (optional)", "Shown to students as a preference match. They never stop anyone from applying."));
+
+  // Work setup: pick one (tap again to clear)
+  const setupField = el("div");
+  setupField.appendChild(labelEl("Work setup"));
+  const setupRow = el("div", "display:flex;gap:6px;flex-wrap:wrap;");
+  const setupBtns = [];
+  const paintSetup = () => setupBtns.forEach(([w, b]) => {
+    const on = postingFormState.workSetup === w;
+    b.style.background = on ? "#1D9E75" : "#FFFFFF";
+    b.style.color = on ? "#FFFFFF" : "#6A6A6A";
+    b.style.border = on ? "1.5px solid #1D9E75" : "1.5px solid #E8E8E8";
+  });
+  WORK_SETUPS.forEach((w) => {
+    const b = el("button", "padding:6px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;");
+    b.type = "button";
+    b.textContent = w;
+    b.addEventListener("click", () => { postingFormState.workSetup = postingFormState.workSetup === w ? "" : w; paintSetup(); });
+    setupBtns.push([w, b]);
+    setupRow.appendChild(b);
+  });
+  paintSetup();
+  setupField.appendChild(setupRow);
+  wrap.appendChild(setupField);
+
+  const progField = el("div");
+  progField.appendChild(labelEl("Preferred programs (comma-separated)"));
+  const progInput = el("input", inputStyleText());
+  progInput.placeholder = "e.g. BSIT, BSCS";
+  progInput.value = postingFormState.preferredProgramsText;
+  progInput.addEventListener("input", (e) => { postingFormState.preferredProgramsText = e.target.value; });
+  progField.appendChild(progInput);
+  wrap.appendChild(progField);
+
+  const yearField = el("div");
+  yearField.appendChild(labelEl("Preferred year levels"));
+  const yearRow = el("div", "display:flex;gap:6px;flex-wrap:wrap;");
+  YEAR_LEVEL_OPTIONS.forEach((yr) => {
+    yearRow.appendChild(toggleChip(yr, postingFormState.preferredYearLevels.includes(yr), (on) => {
+      postingFormState.preferredYearLevels = on
+        ? [...postingFormState.preferredYearLevels, yr]
+        : postingFormState.preferredYearLevels.filter((x) => x !== yr);
+    }));
+  });
+  yearField.appendChild(yearRow);
+  wrap.appendChild(yearField);
+
+  wrap.appendChild(heading("Work conditions & dress code (optional)", "Describe conditions that are part of the job. Do not set requirements based on gender, age, religion or physical appearance."));
+
+  const dressField = el("div");
+  dressField.appendChild(labelEl("Dress code"));
+  const dressSel = el("select", inputStyleText());
+  [""].concat(DRESS_CODES).forEach((d) => {
+    const opt = el("option", "", { value: d, textContent: d || "Not specified" });
+    if (d === postingFormState.dressCode) opt.selected = true;
+    dressSel.appendChild(opt);
+  });
+  dressSel.addEventListener("change", (e) => { postingFormState.dressCode = e.target.value; });
+  dressField.appendChild(dressSel);
+  wrap.appendChild(dressField);
+
+  const dressNotesField = el("div");
+  dressNotesField.appendChild(labelEl("Dress code notes"));
+  const dressNotes = el("input", inputStyleText());
+  dressNotes.placeholder = "e.g. Closed shoes; company shirt on Fridays";
+  dressNotes.value = postingFormState.dressNotes;
+  dressNotes.addEventListener("input", (e) => { postingFormState.dressNotes = e.target.value; });
+  dressNotesField.appendChild(dressNotes);
+  wrap.appendChild(dressNotesField);
+
+  const physField = el("div");
+  physField.appendChild(labelEl("Physical demands of the job"));
+  const physRow = el("div", "display:flex;gap:6px;flex-wrap:wrap;");
+  PHYSICAL_DEMANDS.forEach((d) => {
+    physRow.appendChild(toggleChip(d, postingFormState.physicalDemands.includes(d), (on) => {
+      postingFormState.physicalDemands = on
+        ? [...postingFormState.physicalDemands, d]
+        : postingFormState.physicalDemands.filter((x) => x !== d);
+    }));
+  });
+  physField.appendChild(physRow);
+  wrap.appendChild(physField);
+
+  const physNotesField = el("div");
+  physNotesField.appendChild(labelEl("Notes on physical requirements"));
+  const physNotes = el("input", inputStyleText());
+  physNotes.placeholder = "e.g. Lifting boxes up to 10 kg during inventory";
+  physNotes.value = postingFormState.physicalNotes;
+  physNotes.addEventListener("input", (e) => { postingFormState.physicalNotes = e.target.value; });
+  physNotesField.appendChild(physNotes);
+  wrap.appendChild(physNotesField);
+}
+
 function mapPostingRow(row) {
   const c = row.companies || {};
   return {
@@ -31,6 +931,15 @@ function mapPostingRow(row) {
     companyIndustry: c.industry || "",
     companySpecialization: c.specialization || "",
     companyAbout: c.about || "",
+    lat: row.lat == null ? null : Number(row.lat),
+    lng: row.lng == null ? null : Number(row.lng),
+    workSetup: row.work_setup || "",
+    preferredPrograms: row.preferred_programs || [],
+    preferredYearLevels: row.preferred_year_levels || [],
+    dressCode: row.dress_code || "",
+    dressNotes: row.dress_notes || "",
+    physicalDemands: row.physical_demands || [],
+    physicalNotes: row.physical_notes || "",
   };
 }
 
@@ -175,8 +1084,15 @@ async function loadStudentData() {
     profileState.program = s.program || "";
     profileState.yearLevel = s.year_level || "";
     profileState.resumeFilename = s.resume_filename || "";
+    profileState.resumePath = s.resume_path || "";
+    profileState.workSetupPref = s.work_setup_pref || [];
+    profileState.maxDistanceKm = s.max_distance_km || 0;
     state.hasProfile = !!(s.program); // onboarding sets program, so its presence = profile completed
   }
+
+  await loadResumeChecks([profileState.resumePath]);
+  await loadMySkillProofs();
+  await loadQuizSkills();
 
   const { data: apps } = await sb.from("applications").select("posting_id, status").eq("student_id", studentId);
   state.appliedIds = new Set((apps || []).map((a) => a.posting_id));
@@ -201,6 +1117,10 @@ async function persistProfile() {
     skills: profileState.skills,
     interests: profileState.interests,
   }).eq("id", studentId);
+  await sb.from("students").update({
+    work_setup_pref: profileState.workSetupPref,
+    max_distance_km: profileState.maxDistanceKm || null,
+  }).eq("id", studentId);
 }
 
 // ---------------------------------------------------------
@@ -209,32 +1129,53 @@ async function persistProfile() {
 // ---------------------------------------------------------
 async function uploadResume(file) {
   if (!studentId || !file) return;
-  if (file.type !== "application/pdf") {
-    alert("Please upload a PDF file.");
+  if (file.type !== "application/pdf" || !(await hasPdfSignature(file))) {
+    alert("Please upload a real PDF file.");
     return;
   }
   profileState.resumeUploading = true;
+  profileState.resumeStage = "Uploading\u2026";
   render();
 
-  const path = `${studentId}/${file.name}`;
+  // Unique path so a rejected upload can never delete an earlier, valid resume.
+  const safeName = file.name.replace(/[^\w.\-]+/g, "_");
+  const path = `${studentId}/${Date.now()}-${safeName}`;
   const { error: uploadError } = await sb.storage
     .from("resumes")
-    .upload(path, file, { upsert: true, contentType: "application/pdf" });
+    .upload(path, file, { upsert: false, contentType: "application/pdf" });
 
   if (uploadError) {
     profileState.resumeUploading = false;
+    profileState.resumeStage = "";
     alert("Resume upload failed: " + uploadError.message);
     render();
     return;
   }
 
+  // Check that the file looks like a real resume before attaching it to the profile.
+  profileState.resumeStage = "Checking resume\u2026";
+  render();
+  const check = await verifyResume(path);
+  if (check.status === "rejected") {
+    delete resumeChecks[path];
+    profileState.resumeUploading = false;
+    profileState.resumeStage = "";
+    alert("This file doesn't look like a resume. " + (check.reasons[0] || "") + " Please upload your actual resume.");
+    render();
+    return;
+  }
+
+  const previousPath = profileState.resumePath;
   await sb.from("students").update({
     resume_path: path,
     resume_filename: file.name,
   }).eq("id", studentId);
+  if (previousPath && previousPath !== path) await sb.storage.from("resumes").remove([previousPath]);
 
   profileState.resumeFilename = file.name;
+  profileState.resumePath = path;
   profileState.resumeUploading = false;
+  profileState.resumeStage = "";
   render();
 }
 
@@ -245,6 +1186,7 @@ async function removeResume() {
   if (path) await sb.storage.from("resumes").remove([path]);
   await sb.from("students").update({ resume_path: null, resume_filename: null }).eq("id", studentId);
   profileState.resumeFilename = "";
+  profileState.resumePath = "";
   render();
 }
 
@@ -336,6 +1278,8 @@ const CURRENCY_OPTIONS = [
 const postingFormState = {
   id: null, role: "", location: "", summary: "", description: "", tags: [], tagInput: "",
   salaryCurrency: "PHP", salaryCustomSymbol: "", salaryAmount: "", salaryPeriod: "month", salaryUnpaid: false,
+  workSetup: "", preferredProgramsText: "", preferredYearLevels: [], dressCode: "", dressNotes: "",
+  physicalDemands: [], physicalNotes: "", lat: null, lng: null, locationGeocoded: "",
 };
 
 // Best-effort parse of an existing "\u20b18,000/month" style string back into
@@ -367,6 +1311,16 @@ function resetPostingForm(existing) {
     postingFormState.summary = existing.summary || "";
     postingFormState.description = existing.description || "";
     postingFormState.tags = [...existing.tags];
+    postingFormState.workSetup = existing.workSetup || "";
+    postingFormState.preferredProgramsText = (existing.preferredPrograms || []).join(", ");
+    postingFormState.preferredYearLevels = [...(existing.preferredYearLevels || [])];
+    postingFormState.dressCode = existing.dressCode || "";
+    postingFormState.dressNotes = existing.dressNotes || "";
+    postingFormState.physicalDemands = [...(existing.physicalDemands || [])];
+    postingFormState.physicalNotes = existing.physicalNotes || "";
+    postingFormState.lat = existing.lat;
+    postingFormState.lng = existing.lng;
+    postingFormState.locationGeocoded = existing.lat != null ? (existing.location || "").trim() : "";
     const parsed = parseSalaryString(existing.salary);
     postingFormState.salaryCurrency = parsed.currency;
     postingFormState.salaryCustomSymbol = parsed.customSymbol;
@@ -380,6 +1334,16 @@ function resetPostingForm(existing) {
     postingFormState.summary = "";
     postingFormState.description = "";
     postingFormState.tags = [];
+    postingFormState.workSetup = "";
+    postingFormState.preferredProgramsText = "";
+    postingFormState.preferredYearLevels = [];
+    postingFormState.dressCode = "";
+    postingFormState.dressNotes = "";
+    postingFormState.physicalDemands = [];
+    postingFormState.physicalNotes = "";
+    postingFormState.lat = null;
+    postingFormState.lng = null;
+    postingFormState.locationGeocoded = "";
     postingFormState.salaryCurrency = "PHP";
     postingFormState.salaryCustomSymbol = "";
     postingFormState.salaryAmount = "";
@@ -404,6 +1368,14 @@ function composeSalaryString() {
 }
 
 async function savePostingForm() {
+  // Turn the typed location into coordinates when it is new or changed (used for "Near me").
+  const loc = postingFormState.location.trim();
+  if (loc && postingFormState.locationGeocoded !== loc) {
+    const g = await geocodeLocation(loc);
+    postingFormState.lat = g ? g.lat : null;
+    postingFormState.lng = g ? g.lng : null;
+    postingFormState.locationGeocoded = g ? loc : "";
+  }
   const payload = {
     company: companyName,
     role: postingFormState.role,
@@ -414,11 +1386,22 @@ async function savePostingForm() {
     logo: companyName.trim().charAt(0).toUpperCase() || "?",
     company_id: companyId,
     salary: composeSalaryString(),
+    lat: postingFormState.lat,
+    lng: postingFormState.lng,
+    work_setup: postingFormState.workSetup || null,
+    preferred_programs: parseList(postingFormState.preferredProgramsText),
+    preferred_year_levels: postingFormState.preferredYearLevels,
+    dress_code: postingFormState.dressCode || null,
+    dress_notes: postingFormState.dressNotes,
+    physical_demands: postingFormState.physicalDemands,
+    physical_notes: postingFormState.physicalNotes,
   };
-  if (postingFormState.id) {
-    await sb.from("postings").update(payload).eq("id", postingFormState.id);
-  } else {
-    await sb.from("postings").insert(payload);
+  const result = postingFormState.id
+    ? await sb.from("postings").update(payload).eq("id", postingFormState.id)
+    : await sb.from("postings").insert(payload);
+  if (result.error) {
+    alert("Could not save the listing: " + result.error.message);
+    return;
   }
   await loadCompanyListings();
   state.companyView = "list";
@@ -605,6 +1588,8 @@ async function loadApplicantsForPosting(postingId) {
       },
     };
   });
+  await loadResumeChecks(companyApplicants.map((a) => a.student.resume_path));
+  await loadApplicantProofs(companyApplicants.map((a) => a.student.id));
 }
 
 // Opens a short-lived signed URL to an applicant's resume (private bucket).
@@ -651,7 +1636,7 @@ async function loadCoordinatorData() {
 
   const [appsRes, postsRes] = await Promise.all([
     sb.from("applications")
-      .select("id, status, applied_at, resume_path, resume_filename, students(name, program, year_level, skills, resume_path, resume_filename), postings!inner(role, company, location, company_id)")
+      .select("id, status, applied_at, resume_path, resume_filename, students(id, name, program, year_level, skills, resume_path, resume_filename), postings!inner(role, company, location, company_id, tags)")
       .in("postings.company_id", companyIds)
       .order("applied_at", { ascending: false }),
     sb.from("postings")
@@ -674,6 +1659,9 @@ async function loadCoordinatorData() {
       posting: row.postings || {},
     };
   });
+
+  await loadResumeChecks(coordinatorApplications.map((a) => a.student.resume_path));
+  await loadApplicantProofs(coordinatorApplications.map((a) => a.student.id));
 
   coordinatorPostings = (postsRes.data || []).map((r) => ({
     id: r.id,
@@ -721,13 +1709,17 @@ async function markListingsSeen() {
 }
 
 function resumeButton(s) {
-  const btn = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;margin-bottom:12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
+  const btn = el("button", "display:flex;align-items:center;gap:6px;background:#E8F7F2;border:none;border-radius:10px;padding:8px 12px;cursor:pointer;color:#1D9E75;font-size:12px;font-weight:600;width:100%;");
   btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
   const label = el("span");
   label.textContent = s.resume_filename ? `View Resume — ${s.resume_filename}` : "View Resume";
   btn.appendChild(label);
   btn.addEventListener("click", () => viewResume(s.resume_path));
-  return btn;
+  const wrap = el("div", "margin-bottom:12px;");
+  wrap.appendChild(btn);
+  const badge = resumeBadge(s.resume_path, true);
+  if (badge) wrap.appendChild(badge);
+  return wrap;
 }
 
 // ---------------------------------------------------------
@@ -748,6 +1740,13 @@ const state = {
   showHomeFilter: false,
   showQuiz: false,
   matchScores: {}, // { postingId: { score, baseline } } — from recomputeMatches()
+  myLoc: null,        // { lat, lng } - memory only, never stored
+  locStatus: "",
+  sortMode: "fit",    // fit | stars | nearest | overall
+  radiusKm: 0,        // 0 = any distance
+  quizSkills: new Set(),
+  skillQuiz: null,
+  certBusy: "",
 };
 
 const contentEl = document.getElementById("app-content");
@@ -776,6 +1775,11 @@ function render() {
 
   if (!state.hasProfile) {
     contentEl.appendChild(renderOnboardingScreen());
+    return;
+  }
+
+  if (state.skillQuiz) {
+    contentEl.appendChild(renderSkillQuizScreen());
     return;
   }
 
@@ -1727,6 +2731,8 @@ function renderPostingForm() {
   tagsField.appendChild(tagsBox);
   wrap.appendChild(tagsField);
 
+  appendPostingExtras(wrap);
+
   const saveBtn = el("button", "width:100%;padding:15px;background:#1D9E75;border:none;border-radius:14px;color:#FFFFFF;font-size:15px;font-weight:600;cursor:pointer;letter-spacing:-0.2px;");
   saveBtn.textContent = postingFormState.id ? "Save Changes" : "Post Listing";
   saveBtn.addEventListener("click", () => {
@@ -1792,6 +2798,9 @@ function renderApplicantsScreen() {
       });
       card.appendChild(skillsRow);
     }
+
+    const evidenceBlock = applicantEvidenceBlock(s, applicantRequiredSkills());
+    if (evidenceBlock) card.appendChild(evidenceBlock);
 
     if (s.resume_path) {
       card.appendChild(resumeButton(s));
@@ -1881,6 +2890,9 @@ function coordinatorApplicationCard(app) {
   progP.textContent = `${s.program || "No program set"} · ${s.year_level || "—"} Year`;
   card.appendChild(roleP);
   card.appendChild(progP);
+
+  const evidenceBlock = applicantEvidenceBlock(s, p.tags || []);
+  if (evidenceBlock) card.appendChild(evidenceBlock);
 
   if (s.resume_path) card.appendChild(resumeButton(s));
 
@@ -2177,7 +3189,7 @@ function renderHomeScreen() {
     state.homeFilter === "All"
       ? POSTINGS
       : POSTINGS.filter((p) => p.location.toLowerCase().includes(state.homeFilter.toLowerCase()))
-  ).slice().sort((a, b) => getFitScore(b.id) - getFitScore(a.id));
+  ).filter(passesRadius).slice().sort(postingComparator());
 
   const header = el("div", "padding:20px 24px 0;background:#FAFAFA;");
   const headerTop = el("div", "display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px;");
@@ -2221,8 +3233,10 @@ function renderHomeScreen() {
     header.appendChild(filterRow);
   }
 
+  header.appendChild(renderSortControls());
+
   const countLine = el("p", "font-size:12px;color:#ABABAB;margin:10px 0 0;");
-  countLine.textContent = `${filtered.length} internships · Ranked by fit`;
+  countLine.textContent = `${filtered.length} internships · Ranked by ${SORT_LABELS[state.sortMode] || "fit"}`;
   header.appendChild(countLine);
 
   root.appendChild(header);
@@ -2294,6 +3308,8 @@ function renderPostingCard(posting, rank) {
   info.appendChild(topRow);
   info.appendChild(roleTitle);
   info.appendChild(summary);
+  const signals = postingSignalsRow(posting);
+  if (signals) info.appendChild(signals);
   if (posting.salary) {
     const salaryChip = el("p", "font-size:12px;color:#1D9E75;font-weight:600;margin:0 0 10px;");
     salaryChip.textContent = posting.salary;
@@ -2326,12 +3342,13 @@ function toggleSave(id) {
 // Apply flow — lets the student choose their profile resume
 // or upload one specifically for this application.
 // ---------------------------------------------------------
-const applyFormState = { useProfileResume: true, file: null, uploading: false };
+const applyFormState = { useProfileResume: true, file: null, uploading: false, ack: false };
 
 function resetApplyForm() {
   applyFormState.useProfileResume = !!profileState.resumeFilename;
   applyFormState.file = null;
   applyFormState.uploading = false;
+  applyFormState.ack = false;
 }
 
 async function submitApplication(postingId) {
@@ -2339,34 +3356,56 @@ async function submitApplication(postingId) {
   let resumeFilename = null;
 
   if (!applyFormState.useProfileResume && applyFormState.file) {
+    const file = applyFormState.file;
+    if (file.type !== "application/pdf" || !(await hasPdfSignature(file))) {
+      alert("Please upload a real PDF file.");
+      return;
+    }
     applyFormState.uploading = true;
     render();
-    const path = `${studentId}/applications/${postingId}-${applyFormState.file.name}`;
+    const safeName = file.name.replace(/[^\w.\-]+/g, "_");
+    const path = `${studentId}/applications/${postingId}-${Date.now()}-${safeName}`;
     const { error } = await sb.storage
       .from("resumes")
-      .upload(path, applyFormState.file, { upsert: true, contentType: "application/pdf" });
+      .upload(path, file, { upsert: false, contentType: "application/pdf" });
     if (error) {
       applyFormState.uploading = false;
       alert("Resume upload failed: " + error.message);
       render();
       return;
     }
+    const check = await verifyResume(path);
+    if (check.status === "rejected") {
+      delete resumeChecks[path];
+      applyFormState.uploading = false;
+      applyFormState.file = null;
+      alert("This file doesn't look like a resume. " + (check.reasons[0] || "") + " Please upload your actual resume.");
+      render();
+      return;
+    }
     resumePath = path;
-    resumeFilename = applyFormState.file.name;
+    resumeFilename = file.name;
   }
-
-  state.appliedIds.add(postingId);
-  state.selectedPostingId = null;
-  applyFormState.uploading = false;
-  render();
 
   if (!studentId) return;
   const payload = { student_id: studentId, posting_id: postingId };
+  const appliedPosting = POSTINGS.find((p) => p.id === postingId);
+  if (appliedPosting && postingHasConditions(appliedPosting)) payload.conditions_acknowledged = true;
   if (resumePath) {
     payload.resume_path = resumePath;
     payload.resume_filename = resumeFilename;
   }
-  await sb.from("applications").upsert(payload, { onConflict: "student_id,posting_id" });
+  const { error: applyError } = await sb.from("applications").upsert(payload, { onConflict: "student_id,posting_id" });
+  applyFormState.uploading = false;
+  if (applyError) {
+    alert("Could not submit your application: " + applyError.message);
+    render();
+    return;
+  }
+  // Only show "applied" once the application is really saved.
+  state.appliedIds.add(postingId);
+  state.selectedPostingId = null;
+  render();
 }
 
 // ===========================================================
@@ -2454,6 +3493,11 @@ function renderPostingDetailScreen(posting) {
   card2.appendChild(tagsRow);
   content.appendChild(card2);
 
+  const skillsMatchCard = renderSkillsMatchCard(posting);
+  if (skillsMatchCard) content.appendChild(skillsMatchCard);
+  const prefMatchCard = renderPreferenceMatchCard(posting);
+  if (prefMatchCard) content.appendChild(prefMatchCard);
+
   // Why this match — visual breakdown behind the fit %
   const breakdown = getMatchBreakdown(posting);
   if (breakdown.directMatches.length > 0 || breakdown.sharedGroupCount > 0) {
@@ -2493,6 +3537,13 @@ function renderPostingDetailScreen(posting) {
   card3.appendChild(h3b);
   card3.appendChild(descP);
   content.appendChild(card3);
+
+  const conditionsCard = renderConditionsCard(posting);
+  if (conditionsCard) {
+    conditionsCard.style.marginTop = "12px";
+    content.appendChild(conditionsCard);
+    if (!applied) content.appendChild(renderAckCard());
+  }
 
   // Resume for this application (only relevant before applying)
   if (!applied) {
@@ -2550,7 +3601,8 @@ function renderPostingDetailScreen(posting) {
 
   // Apply CTA
   const ctaWrap = el("div", "padding:12px 24px 20px;background:#FAFAFA;border-top:1px solid #EFEFEF;flex-shrink:0;");
-  const canApply = applied || applyFormState.useProfileResume || !!applyFormState.file;
+  const canApply = (applied || applyFormState.useProfileResume || !!applyFormState.file) &&
+    (applied || !postingHasConditions(posting) || applyFormState.ack);
   const applyBtn = el("button", `width:100%;padding:15px;background:${applied ? "#E8F7F2" : "#1D9E75"};border:none;border-radius:14px;color:${applied ? "#1D9E75" : "#FFFFFF"};font-size:15px;font-weight:600;cursor:${applied || !canApply ? "default" : "pointer"};letter-spacing:-0.2px;transition:background 0.2s ease;opacity:${!applied && !canApply ? 0.5 : 1};`);
   if (applied) applyBtn.className = "pop-in";
   applyBtn.textContent = applied
@@ -2677,7 +3729,11 @@ const profileState = {
   yearLevel: "",
   saved: false,
   resumeFilename: "",
+  resumePath: "",
   resumeUploading: false,
+  resumeStage: "",
+  workSetupPref: [],
+  maxDistanceKm: 0,
 };
 
 function renderProfileScreen() {
@@ -2830,6 +3886,8 @@ function renderProfileScreen() {
   interestsCard.appendChild(interestsLabel);
   interestsCard.appendChild(interestsTextarea);
   content.appendChild(interestsCard);
+  content.appendChild(renderSkillProofsCard());
+  content.appendChild(renderPreferencesCard());
 
   // Resume upload
   const resumeCard = el("div", "background:#FFFFFF;border-radius:14px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.05);");
@@ -2839,7 +3897,7 @@ function renderProfileScreen() {
 
   if (profileState.resumeUploading) {
     const uploadingP = el("p", "font-size:13px;color:#8A8A8A;margin:0;");
-    uploadingP.textContent = "Uploading\u2026";
+    uploadingP.textContent = profileState.resumeStage || "Uploading\u2026";
     resumeCard.appendChild(uploadingP);
   } else if (profileState.resumeFilename) {
     const fileRow = el("div", "display:flex;align-items:center;justify-content:space-between;background:#F9F9F9;border-radius:10px;padding:10px 12px;border:1.5px solid #EFEFEF;");
@@ -2854,6 +3912,8 @@ function renderProfileScreen() {
     fileRow.appendChild(fileInfo);
     fileRow.appendChild(removeBtn);
     resumeCard.appendChild(fileRow);
+    const resumeStatusBadge = resumeBadge(profileState.resumePath, true);
+    if (resumeStatusBadge) resumeCard.appendChild(resumeStatusBadge);
 
     const replaceLabel = el("label", "display:inline-block;margin-top:10px;font-size:12px;color:#1D9E75;font-weight:600;cursor:pointer;");
     replaceLabel.textContent = "Replace resume";
